@@ -2,5 +2,5 @@
 #pragma once
 
 namespace bn {
-constexpr const char* kVersion = "1.0.3";
+constexpr const char* kVersion = "1.0.4";
 }

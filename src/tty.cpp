@@ -67,56 +67,6 @@ int measureWide(HANDLE out) {
   SetConsoleCursorPosition(out, save);
   return (w == 1 || w == 2) ? w : 2;
 }
-/* 向终端本身要真实可见尺寸。
-   ConPTY 下 GetConsoleScreenBufferInfo 给的是 conhost 自己的缓冲区尺寸，可能和终端可见列数不一致。
-   这里用「光标移到极限 + 位置报告（CPR）」问一次：ESC[9999;9999H 然后 ESC[6n，终端回 ESC[行;列R。
-   问不到就返回 false，退回老办法。 */
-bool queryTermSize(HANDLE hin, HANDLE hout, int& cols, int& rows) {
-  DWORD oldIn = 0, oldOut = 0;
-  if (!GetConsoleMode(hin, &oldIn) || !GetConsoleMode(hout, &oldOut)) return false;
-  SetConsoleMode(hin, (oldIn | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~ENABLE_PROCESSED_INPUT);
-  if (!SetConsoleMode(hout, oldOut | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
-    SetConsoleMode(hin, oldIn);
-    return false;
-  }
-  const char req[] = "\x1b[s\x1b[9999;9999H\x1b[6n\x1b[u";
-  DWORD n = 0;
-  WriteFile(hout, req, sizeof(req) - 1, &n, nullptr);
-
-  bool ok = false;
-  std::string buf;
-  DWORD t0 = GetTickCount();
-  while (GetTickCount() - t0 < 300) {
-    DWORD avail = 0;
-    if (!GetNumberOfConsoleInputEvents(hin, &avail) || avail == 0) {
-      Sleep(5);
-      continue;
-    }
-    INPUT_RECORD rec;
-    DWORD got = 0;
-    if (!ReadConsoleInputW(hin, &rec, 1, &got) || got == 0) break;
-    if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
-    wchar_t c = rec.Event.KeyEvent.uChar.UnicodeChar;
-    if (c >= 32 && c < 128) buf += (char)c;
-    size_t p = buf.find("[");
-    while (p != std::string::npos) {
-      int r = 0, cc = 0;
-      if (sscanf_s(buf.c_str() + p, "[%d;%dR", &r, &cc) == 2 && r > 0 && cc > 0) {
-        rows = r;
-        cols = cc;
-        ok = true;
-        break;
-      }
-      p = buf.find("[", p + 1);
-    }
-    if (ok) break;
-    if (buf.size() > 96) buf.erase(0, 48);
-  }
-  SetConsoleMode(hin, oldIn);
-  SetConsoleMode(hout, oldOut);
-  return ok;
-}
-
 /* 让「窗口」和「缓冲区」是同一个矩形。
    不对齐的话，用户把窗口拉窄/拉矮之后控制台会横向或纵向滚动，srWindow 的 Left/Top 不再是 0，
    整个界面就整体偏移、右边被切掉（1.0.0 的截断就是这样来的）。 */
@@ -537,6 +487,7 @@ bool App::init() {
   GetConsoleMode(hin_, &oldInMode_);
   // 只要按键与窗口尺寸事件：不排队鼠标事件，界面天然不响应点击
   SetConsoleMode(hin_, ENABLE_WINDOW_INPUT);
+  FlushConsoleInputBuffer(hin_);   // 丢掉进入界面前残留的输入记录
 
   GetConsoleCursorInfo(hout_, &oldCursor_);
   CONSOLE_CURSOR_INFO ci = oldCursor_;
@@ -567,12 +518,11 @@ bool App::init() {
       aligned_ = alignBuffer(hout_, vp);
     }
   }
-  if (queryTermSize(hin_, hout_, termW_, termH_)) {
-    if (termW_ < 20 || termH_ < 8) { termW_ = 0; termH_ = 0; }
-  } else {
-    termW_ = 0;
-    termH_ = 0;
-  }
+  // 不再向终端发 DSR（ESC[6n）问尺寸：响应会以按键形式回到输入缓冲，
+  // 其中的数字会被当成 1~4 切页快捷键 —— 一改窗口大小页面就乱跳。
+  // ConPTY / conhost 自报的 srWindow 已经和真实窗口一致（实测多档尺寸都对得上）。
+  termW_ = 0;
+  termH_ = 0;
   g_wideW = measureWide(hout_);
   cfg_ = loadConfig();
   me_ = cfg_.login;
@@ -1224,11 +1174,12 @@ void App::draw() {
 
   if (const char* pf = getenv("BN_TUI_PROBE")) {
     static int done = 0;
-    static int lastCW = -1, lastCH = -1;
-    // 只在「可见尺寸变化」时落盘：用来验证拖窗口后是否按新尺寸重排
-    if (W != lastCW || H != lastCH) {
+    static int lastCW = -1, lastCH = -1, lastView = -1;
+    // 尺寸或所在页变化时落盘：用来验证 resize 重排 / 按键切页
+    if (W != lastCW || H != lastCH || view_ != lastView) {
       lastCW = W;
       lastCH = H;
+      lastView = view_;
       done++;
       std::vector<CHAR_INFO> all((size_t)W * H);
       COORD sz{(SHORT)W, (SHORT)H}, pz{0, 0};
@@ -1239,9 +1190,9 @@ void App::draw() {
       std::string dump;
       char head[128];
       snprintf(head, sizeof(head),
-               "frame=%d buffer=%dx%d win=(%d,%d)-(%d,%d) term=%dx%d canvas=%dx%d wide=%d\n",
-               done, cb2.dwSize.X, cb2.dwSize.Y, cb2.srWindow.Left, cb2.srWindow.Top,
-               cb2.srWindow.Right, cb2.srWindow.Bottom, termW_, termH_, W, H, g_wideW);
+               "frame=%d view=%d detail=%d buffer=%dx%d win=(%d,%d)-(%d,%d) canvas=%dx%d wide=%d\n",
+               done, view_, inDetail_ ? 1 : 0, cb2.dwSize.X, cb2.dwSize.Y, cb2.srWindow.Left,
+               cb2.srWindow.Top, cb2.srWindow.Right, cb2.srWindow.Bottom, W, H, g_wideW);
       dump += head;
       for (int y = 0; y < H; y++) {
         std::wstring line;
@@ -1261,6 +1212,9 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
     PostQuitMessage(0);
     return;
   }
+  // 终端对转义序列的「回复」（比如光标位置报告）会以虚拟键码为 0 的字符形式
+  // 混进输入队列，其中的数字会被当成 1~4 切页 —— 一律不当按键处理。
+  if (k.wVirtualKeyCode == 0 && k.uChar.UnicodeChar != 0) return;
 
   /* ---- 输入框 ---- */
   if (edit_ != E_NONE) {
@@ -1492,14 +1446,8 @@ bool App::checkSize() {
   sizeChanged_ = true;
   // 高度变了，可显示的行数也变了：把选中项拉回视野内，别让它留在屏幕外
   clampSel();
-  int tw = 0, th = 0;
-  if (queryTermSize(hin_, hout_, tw, th) && tw >= 20 && th >= 8) {
-    termW_ = tw;
-    termH_ = th;
-  } else {
-    termW_ = 0;
-    termH_ = 0;
-  }
+  termW_ = 0;
+  termH_ = 0;
   return true;
 }
 
