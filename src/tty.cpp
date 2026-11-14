@@ -232,9 +232,11 @@ void appendUtf8(std::string& out, uint32_t cp) {
 
 class Canvas {
  public:
-  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci, int maxW, int maxH, bool vt) {
+  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci, int maxW, int maxH, bool vt,
+             bool clear = false) {
     out_ = out;
     vt_ = vt;
+    clear_ = clear;
     origin_ = COORD{ci.srWindow.Left, ci.srWindow.Top};
     W_ = ci.srWindow.Right - ci.srWindow.Left + 1;
     H_ = ci.srWindow.Bottom - ci.srWindow.Top + 1;
@@ -295,6 +297,7 @@ class Canvas {
     std::string out;
     out.reserve((size_t)W_ * 48 + 256);
     out += "\x1b[?25l";   // 藏光标
+    if (clear_) out += "\x1b[2J";   // 尺寸刚变：和整帧一起写，避免「先擦白再画」闪一下
     WORD cur = 0xFFFF;
     for (int y = 0; y < H_; y++) {
       char cup[24];
@@ -331,6 +334,7 @@ class Canvas {
   HANDLE out_ = INVALID_HANDLE_VALUE;
   int W_ = 0, H_ = 0;
   bool vt_ = false;
+  bool clear_ = false;
   COORD origin_{0, 0};
   std::vector<CHAR_INFO> buf_;
 };
@@ -478,6 +482,7 @@ class App {
   int lastW_ = 0, lastH_ = 0; // 上一帧的可见尺寸，用来感知窗口变化
   int termW_ = 0, termH_ = 0; // 终端自报的可见尺寸（VT 查询），0 = 没问到
   bool vtOk_ = false;         // 能用 VT 序列画（现代终端）：走备用屏，不碰滚动历史
+  bool sizeChanged_ = false;  // 上一帧之后窗口尺寸变过，这一帧要先清屏
 };
 
 Ctx App::ctx() const {
@@ -916,20 +921,31 @@ std::vector<Row> App::rowsGrp(int width) {
     out.push_back({busy_ ? L"正在读取主站…" : L"（没有文章）", A_DIM, false});
     return out;
   }
-  bool narrow = width < 74;
+  /* 列宽按可用宽度逐档收缩，而不是以某个宽度一刀切：
+     先保标题（至少 24 格），再依次收掉点赞、日期、作者。这样拉窗口时
+     是「一列一列地淡出」，不会整行排版突然跳一下。 */
+  const int fixed = 5 + 6 + 1;              // 编号 + 分类 + 分隔
+  const int authorW = 13, dateW = 6, upW = 3;
+  int rest = width - fixed;
+  bool showUp = rest - 24 >= 1 + authorW + 1 + dateW + 1 + upW;
+  bool showDate = rest - 24 >= 1 + authorW + 1 + dateW;
+  bool showAuthor = rest - 24 >= 1 + authorW;
+  int tailW = 0;
+  if (showUp) tailW += 1 + authorW + 1 + dateW + 1 + upW;
+  else if (showDate) tailW += 1 + authorW + 1 + dateW;
+  else if (showAuthor) tailW += 1 + authorW;
+  int titleW = std::max(12, rest - tailW);
+
   for (size_t i = 0; i < posts_.size(); i++) {
     auto& p = posts_[i];
     std::wstring line = padTo(WW(std::to_string(p.number)), 5) +
                         padTo(WW(p.cat.empty() ? "—" : p.cat), 6) + L" ";
-    int used = 5 + 6 + 1;
     std::wstring tail;
-    if (!narrow) {
-      tail = L" " + padTo(WW(p.author), 13) + L" " +
-             padTo(WW(p.created.size() >= 10 ? p.created.substr(5, 5) : p.created), 6) + L" " +
-             padTo(WW(std::to_string(p.upvotes)), 3);
-      used += 1 + 13 + 1 + 6 + 1 + 3;
-    }
-    int titleW = std::max(10, width - used - 1);
+    if (showAuthor)
+      tail += L" " + padTo(WW(p.author), authorW);
+    if (showDate)
+      tail += L" " + padTo(WW(p.created.size() >= 10 ? p.created.substr(5, 5) : p.created), dateW);
+    if (showUp) tail += L" " + padTo(WW(std::to_string(p.upvotes)), upW);
     line += padTo(WW(p.title), titleW) + tail;
     out.push_back({truncateTo(line, width), p.pinned ? A_WARN : A_NORM, (int)i == sel_});
   }
@@ -960,13 +976,20 @@ std::vector<Row> App::rowsBooks(int width) {
     out.push_back({busy_ ? L"正在读取书阁…" : L"（没有找到书）", A_DIM, false});
     return out;
   }
-  bool narrow = width < 80;
+  /* 同样是逐档收缩：字数 → 作者收窄 → 章数，标题弹性吃掉剩余宽度 */
+  int statusW = 6 + 4;                       // 完结/连载 + 公开/私密
+  int authorW = width - 30 - 1 - 9 - 12 - statusW >= 0 ? 14 : 10;
+  bool showWords = width >= authorW + 9 + 12 + statusW + 26;
+  bool showChaps = width >= authorW + 9 + statusW + 20;
+  int used = authorW + statusW + (showChaps ? 9 : 0) + (showWords ? 12 : 0);
+  int titleW = std::max(16, width - used);
+
   for (size_t i = 0; i < books_.size(); i++) {
     auto& b = books_[i];
-    std::wstring line = padTo(WW(b.title), narrow ? 24 : 30) + L" " +
-                        padTo(WW(b.author), narrow ? 10 : 14) +
-                        padTo(WW(std::to_string(b.chapters) + " 章"), 9);
-    if (!narrow) line += padTo(WW(std::to_string(b.words) + " 字"), 12);
+    std::wstring line = padTo(WW(b.title), titleW) +
+                        padTo(WW(b.author), authorW);
+    if (showChaps) line += padTo(WW(std::to_string(b.chapters) + " 章"), 9);
+    if (showWords) line += padTo(WW(std::to_string(b.words) + " 字"), 12);
     line += padTo(WW(b.status == "done" ? "完结" : "连载"), 6) +
             WW(b.visibility == "private" ? "私密" : "公开");
     out.push_back({truncateTo(line, width), b.visibility == "private" ? A_WARN : A_NORM,
@@ -1122,9 +1145,10 @@ void App::draw() {
   CONSOLE_SCREEN_BUFFER_INFO ci;
   if (!GetConsoleScreenBufferInfo(hout_, &ci)) return;
   Canvas cv;
-  cv.begin(hout_, ci, termW_, termH_, vtOk_);
+  cv.begin(hout_, ci, termW_, termH_, vtOk_, sizeChanged_);
   const int W = cv.w(), H = cv.h();
   cv.clear();
+  sizeChanged_ = false;
 
   /* 标签栏（留一行上边距：某些终端会把最顶行吃掉） */
   const int topY = 1;
@@ -1200,7 +1224,12 @@ void App::draw() {
 
   if (const char* pf = getenv("BN_TUI_PROBE")) {
     static int done = 0;
-    if (!done++) {
+    static int lastCW = -1, lastCH = -1;
+    // 只在「可见尺寸变化」时落盘：用来验证拖窗口后是否按新尺寸重排
+    if (W != lastCW || H != lastCH) {
+      lastCW = W;
+      lastCH = H;
+      done++;
       std::vector<CHAR_INFO> all((size_t)W * H);
       COORD sz{(SHORT)W, (SHORT)H}, pz{0, 0};
       CONSOLE_SCREEN_BUFFER_INFO cb2;
@@ -1209,9 +1238,10 @@ void App::draw() {
       ReadConsoleOutputW(hout_, all.data(), sz, pz, &rr);
       std::string dump;
       char head[128];
-      snprintf(head, sizeof(head), "buffer=%dx%d win=(%d,%d)-(%d,%d) term=%dx%d canvas=%dx%d wide=%d\n", cb2.dwSize.X,
-               cb2.dwSize.Y, cb2.srWindow.Left, cb2.srWindow.Top, cb2.srWindow.Right,
-               cb2.srWindow.Bottom, termW_, termH_, W, H, g_wideW);
+      snprintf(head, sizeof(head),
+               "frame=%d buffer=%dx%d win=(%d,%d)-(%d,%d) term=%dx%d canvas=%dx%d wide=%d\n",
+               done, cb2.dwSize.X, cb2.dwSize.Y, cb2.srWindow.Left, cb2.srWindow.Top,
+               cb2.srWindow.Right, cb2.srWindow.Bottom, termW_, termH_, W, H, g_wideW);
       dump += head;
       for (int y = 0; y < H; y++) {
         std::wstring line;
@@ -1219,7 +1249,6 @@ void App::draw() {
         dump += utf8ToWideLossless(line) + "\n";
       }
       writeFile(pf, dump);
-      PostQuitMessage(0);
     }
   }
 }
@@ -1458,6 +1487,11 @@ bool App::checkSize() {
   lastH_ = h;
   // 窗口尺寸变了：VT 模式不用管缓冲区；老路径把缓冲区重新对齐成窗口大小
   if (!vtOk_) aligned_ = alignBuffer(hout_, COORD{(SHORT)w, (SHORT)h}) || aligned_;
+  // 新窗口更窄时，旧尺寸写出的长行会被终端折行、留下残影；
+  // 让下一帧整屏前带上清屏序列（和整帧同一次写出，不会闪白）
+  sizeChanged_ = true;
+  // 高度变了，可显示的行数也变了：把选中项拉回视野内，别让它留在屏幕外
+  clampSel();
   int tw = 0, th = 0;
   if (queryTermSize(hin_, hout_, tw, th) && tw >= 20 && th >= 8) {
     termW_ = tw;
@@ -1485,7 +1519,7 @@ void App::loop() {
       dirty_ = false;
     }
 
-    DWORD waited = WaitForSingleObject(hin_, 200);
+    DWORD waited = WaitForSingleObject(hin_, 50);
     if (waited == WAIT_TIMEOUT) {
       if (checkSize()) dirty_ = true;
       continue;
