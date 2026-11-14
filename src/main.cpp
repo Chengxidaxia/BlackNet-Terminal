@@ -17,6 +17,10 @@
 #include "bookfile.h"
 #include "config.h"
 #include "http.h"
+#include "posts.h"
+#include "statusview.h"
+#include "tty.h"
+#include "version.h"
 #include "third_party/json.hpp"
 #include "ui.h"
 #include "util.h"
@@ -147,78 +151,6 @@ void MakeSureDir(const std::string& path) {
   }
 }
 
-/* 主站分类 id ↔ 名称（与 assets/data/categories.json 一致） */
-const char* kCatName(int id) {
-  switch (id) {
-    case 1: return "公告";
-    case 2: return "新闻";
-    case 3: return "资讯";
-    case 4: return "技术";
-    case 5: return "活动";
-    case 6: return "随笔";
-    default: return "";
-  }
-}
-int kCatId(const std::string& s) {
-  if (s.empty()) return -1;
-  bool digits = std::all_of(s.begin(), s.end(), ::isdigit);
-  if (digits) { try { return std::stoi(s); } catch (...) { return -1; } }
-  for (int i = 1; i <= 6; i++)
-    if (s == kCatName(i)) return i;
-  return -1;
-}
-
-/* 正文首行 JSON（站点约定） */
-struct PostMeta {
-  std::string info;
-  std::string icon;
-  std::string coverText;
-  int category = 0;
-  bool hasCategory = false;
-  bool tpl = false;
-  bool allowComments = true;
-  std::vector<std::string> tags;
-  std::string rest;
-};
-
-PostMeta parsePostBody(const std::string& body) {
-  PostMeta m;
-  m.rest = body;
-  size_t nl = body.find('\n');
-  std::string head = trim(nl == std::string::npos ? body : body.substr(0, nl));
-  if (head.empty() || head[0] != '{') return m;
-  try {
-    auto j = nlohmann::json::parse(head);
-    if (j.contains("info") && j["info"].is_string()) {
-      auto raw = b64decode(j["info"].get<std::string>());
-      m.info = std::string(raw.begin(), raw.end());
-    }
-    if (j.contains("icon") && j["icon"].is_string() && !j["icon"].get<std::string>().empty()) {
-      auto raw = b64decode(j["icon"].get<std::string>());
-      m.icon = std::string(raw.begin(), raw.end());
-    }
-    if (j.contains("coverText") && j["coverText"].is_string())
-      m.coverText = j["coverText"].get<std::string>();
-    if (j.contains("category") && j["category"].is_number_integer()) {
-      m.category = j["category"].get<int>();
-      m.hasCategory = true;
-    }
-    if (j.contains("tpl") && j["tpl"].is_boolean()) m.tpl = j["tpl"].get<bool>();
-    if (j.contains("allowComments") && j["allowComments"].is_boolean())
-      m.allowComments = j["allowComments"].get<bool>();
-    if (j.contains("tags") && j["tags"].is_array())
-      for (auto& t : j["tags"])
-        if (t.is_string()) m.tags.push_back(t.get<std::string>());
-    m.rest = nl == std::string::npos ? "" : body.substr(nl + 1);
-  } catch (const std::exception&) {
-  }
-  return m;
-}
-
-std::string stripFirstLine(const std::string& body) {
-  size_t nl = body.find('\n');
-  return nl == std::string::npos ? body : body.substr(nl + 1);
-}
 
 /* ================= 登录 ================= */
 int cmdLogin(const Args& a) {
@@ -301,53 +233,134 @@ int cmdLogout(const Args& a) {
 int cmdGrpList(const Args& a) {
   Ctx c = makeCtx();
   long n = a.num("n", 20);
+  long limit = a.num("limit", 0);
   std::string after = a.str("after");
   std::string catFilter = a.str("cat");
+  std::string tagFilter = a.str("tag");
+  std::string sort = lowerAscii(a.str("sort", "default"));
+  bool asc = a.has("asc");
+  bool all = a.has("all");
+  bool deep = a.has("deep") || sort == "likes" || sort == "updated" || sort == "hot";
+
+  /* 需要客户端排序时多取一些样本：默认 n*5（上限 200），--all 时一直翻到底（上限 500）*/
+  long want = n;
+  if (all) want = limit > 0 ? limit : 500;
+  else if (deep) want = std::min<long>(n * 5, 200);
+  want = std::max<long>(want, 1);
+
   nlohmann::json j;
   std::string err;
-  if (!grpList(c, (int)std::min<long>(n, 100), after, j, err)) return fail(errCode(err), err);
+  if (!grpList(c, (int)std::min<long>(want, 100), after, j, err)) return fail(errCode(err), err);
 
-  auto nodes = j.value("nodes", nlohmann::json::array());
+  struct Item {
+    nlohmann::json raw;
+    std::string title, cat, info, author, created, updated;
+    int catIdNum = 0;
+    int upvotes = 0;
+    bool hasCat = false;
+    std::vector<std::string> tags;
+    bool pinned = false;
+  };
+  std::vector<Item> items;
+  auto collect = [&](const nlohmann::json& nodes) {
+    for (auto& d : nodes) {
+      Item it;
+      it.raw = d;
+      PostMeta m = parsePostBody(d.value("body", ""));
+      it.hasCat = m.hasCategory;
+      it.catIdNum = m.hasCategory ? m.category : 0;
+      it.cat = m.hasCategory ? catName(m.category) : "";
+      it.tags = m.tags;
+      it.info = m.info.empty() ? stripFirstLine(d.value("body", "")) : m.info;
+      it.title = d.value("title", "");
+      it.author = (d.contains("author") && d["author"].is_object()) ? d["author"].value("login", "") : "";
+      it.created = d.value("createdAt", "");
+      it.updated = d.value("updatedAt", "");
+      it.upvotes = d.value("upvoteCount", 0);
+      it.pinned = (m.hasCategory && m.category == 1);   // 公告
+      items.push_back(std::move(it));
+    }
+  };
+  collect(j.value("nodes", nlohmann::json::array()));
+
+  /* deep 模式继续翻页，直到够数或没有下一页 */
+  std::string cursor = j.contains("pageInfo") ? j["pageInfo"].value("endCursor", "") : "";
+  bool more = j.contains("pageInfo") && j["pageInfo"].value("hasNextPage", false);
+  while (deep && more && (long)items.size() < want) {
+    nlohmann::json page;
+    std::string e2;
+    if (!grpList(c, 100, cursor, page, e2)) break;
+    collect(page.value("nodes", nlohmann::json::array()));
+    more = page.contains("pageInfo") && page["pageInfo"].value("hasNextPage", false);
+    cursor = page.contains("pageInfo") ? page["pageInfo"].value("endCursor", "") : "";
+    if (cursor.empty()) break;
+  }
+
+  /* 过滤：分类 + 标签 */
+  std::vector<Item> filtered;
+  int wantCat = catFilter.empty() ? -1 : catId(catFilter);
+  if (!catFilter.empty() && wantCat < 0 && catId(catFilter) != 0)
+    return fail(EX_USAGE, "未知分类：" + catFilter + "（1公告 2新闻 3资讯 4技术 5活动 6随笔）");
+  for (auto& it : items) {
+    if (!catFilter.empty()) {
+      bool hit = (catFilter == it.cat) || (wantCat > 0 && it.hasCat && it.catIdNum == wantCat);
+      if (!hit) continue;
+    }
+    if (!tagFilter.empty()) {
+      bool hit = false;
+      for (auto& t : it.tags)
+        if (lowerAscii(t) == lowerAscii(tagFilter)) { hit = true; break; }
+      if (!hit) continue;
+    }
+    filtered.push_back(it);
+  }
+
+  /* 排序：default（公告置顶 + 时间倒序）/ created / updated / likes */
+  bool byDefault = (sort.empty() || sort == "default");
+  auto byTime = [](const std::string& x, const std::string& y) { return x > y; };
+  std::stable_sort(filtered.begin(), filtered.end(), [&](const Item& x, const Item& y) {
+    if (byDefault) {
+      if (x.pinned != y.pinned) return x.pinned && !asc;
+      return asc ? x.created < y.created : byTime(x.created, y.created);
+    }
+    if (sort == "likes" || sort == "hot") {
+      if (x.upvotes != y.upvotes) return asc ? x.upvotes < y.upvotes : x.upvotes > y.upvotes;
+      return byTime(x.created, y.created);
+    }
+    if (sort == "updated") return asc ? x.updated < y.updated : byTime(x.updated, y.updated);
+    return asc ? x.created < y.created : byTime(x.created, y.created);   // created
+  });
+
+  if (!all && (long)filtered.size() > n) filtered.resize((size_t)n);
+
   std::vector<std::vector<std::string>> rows;
   nlohmann::json outItems = nlohmann::json::array();
-  for (auto& d : nodes) {
-    PostMeta m = parsePostBody(d.value("body", ""));
-    std::string cat = m.hasCategory ? kCatName(m.category) : "";
-    if (!catFilter.empty()) {
-      int want = kCatId(catFilter);
-      if (catFilter != cat && (want < 0 || !m.hasCategory || want != m.category)) continue;
-    }
-    std::string info = m.info;
-    if (info.empty()) info = stripFirstLine(d.value("body", ""));
-    std::string title = d.value("title", "");
-    rows.push_back({padLeft(std::to_string(d.value("number", 0)), 4), cat.empty() ? "—" : cat,
-                    title, (d.contains("author") && d["author"].is_object())
-                               ? d["author"].value("login", "")
-                               : "",
-                    isoToLocal(d.value("createdAt", "")),
-                    std::to_string(d.value("upvoteCount", 0))});
-    outItems.push_back({{"number", d.value("number", 0)},
-                        {"title", title},
-                        {"category", cat},
-                        {"category_id", m.hasCategory ? m.category : 0},
-                        {"author", (d.contains("author") && d["author"].is_object())
-                                       ? d["author"].value("login", "")
-                                       : ""},
-                        {"created_at", d.value("createdAt", "")},
-                        {"updated_at", d.value("updatedAt", "")},
-                        {"upvotes", d.value("upvoteCount", 0)},
-                        {"info", info},
-                        {"tags", m.tags},
-                        {"url", c.cfg.grpBase + "/blog.html?d=" + std::to_string(d.value("number", 0))}});
+  for (auto& it : filtered) {
+    rows.push_back({padLeft(std::to_string(it.raw.value("number", 0)), 4),
+                    it.cat.empty() ? "—" : it.cat, it.title, it.author,
+                    isoToLocal(it.created), std::to_string(it.upvotes)});
+    outItems.push_back({{"number", it.raw.value("number", 0)},
+                        {"title", it.title},
+                        {"category", it.cat},
+                        {"category_id", it.catIdNum},
+                        {"author", it.author},
+                        {"created_at", it.created},
+                        {"updated_at", it.updated},
+                        {"upvotes", it.upvotes},
+                        {"pinned", it.pinned},
+                        {"info", it.info},
+                        {"tags", it.tags},
+                        {"url", c.cfg.grpBase + "/blog.html?d=" +
+                                    std::to_string(it.raw.value("number", 0))}});
   }
   if (g.json) {
-    nlohmann::json data{{"items", outItems}};
+    nlohmann::json data{{"items", outItems}, {"sort", byDefault ? "default" : sort}, {"asc", asc}};
     if (j.contains("pageInfo")) data["page_info"] = j["pageInfo"];
     return ok("", data), EX_OK;
   }
-  if (rows.empty()) return ok(cDim("（这段时间没有文章）")), EX_OK;
+  if (rows.empty()) return ok(cDim("（没有符合条件的文章）")), EX_OK;
   printTable({"#", "分类", "标题", "作者", "时间", "赞"}, rows);
-  if (j.contains("pageInfo") && j["pageInfo"].value("hasNextPage", false)) {
+  if (!deep && j.contains("pageInfo") && j["pageInfo"].value("hasNextPage", false)) {
     std::cout << cDim("\n下一页：bn grp list --after " + j["pageInfo"].value("endCursor", "")) << "\n";
   }
   return EX_OK;
@@ -377,7 +390,7 @@ int cmdGrpShow(const Args& a) {
     data["info"] = m.info;
     data["tags"] = m.tags;
     data["category_id"] = m.hasCategory ? m.category : 0;
-    data["category_name"] = m.hasCategory ? kCatName(m.category) : "";
+    data["category_name"] = m.hasCategory ? catName(m.category) : "";
     data["markdown"] = trim(body);
     data["url"] = c.cfg.grpBase + "/blog.html?d=" + std::to_string(number);
     return ok("", data), EX_OK;
@@ -388,7 +401,7 @@ int cmdGrpShow(const Args& a) {
                                   ? d["author"].value("login", "")
                                   : "?") +
                     " · " + isoToLocal(d.value("createdAt", "")) +
-                    (m.hasCategory ? " · " + std::string(kCatName(m.category)) : ""))
+                    (m.hasCategory ? " · " + std::string(catName(m.category)) : ""))
             << "\n";
   if (!m.tags.empty()) {
     std::string t;
@@ -464,8 +477,8 @@ int cmdGrpPost(const Args& a) {
   std::string info = trim(a.str("info", "无简介"));
   std::vector<std::string> tags = splitAny(a.str("tags"), ",，、");
   std::string cat = trim(a.str("cat"));
-  int catId = cat.empty() ? -1 : kCatId(cat);
-  if (!cat.empty() && catId < 0) return fail(EX_USAGE, "未知分类：" + cat + "（1公告 2新闻 3资讯 4技术 5活动 6随笔）");
+  int catNum = cat.empty() ? -1 : catId(cat);
+  if (!cat.empty() && catNum < 0) return fail(EX_USAGE, "未知分类：" + cat + "（1公告 2新闻 3资讯 4技术 5活动 6随笔）");
 
   nlohmann::json head;
   head["info"] = b64encode(info);
@@ -473,7 +486,7 @@ int cmdGrpPost(const Args& a) {
   head["icon"] = icon.empty() ? "" : b64encode(icon);
   std::string coverText = trim(a.str("cover-text"));
   head["coverText"] = coverText;
-  if (catId > 0) head["category"] = catId;
+  if (catNum > 0) head["category"] = catNum;
   head["tpl"] = a.has("tpl");
   head["allowComments"] = !a.has("no-comments");
   head["tags"] = tags;
@@ -483,7 +496,7 @@ int cmdGrpPost(const Args& a) {
   if (a.has("dry")) {
     if (g.json)
       return ok("", nlohmann::json{{"dry_run", true}, {"title", title}, {"body", fullBody},
-                                   {"category_id", catId}}),
+                                   {"category_id", catNum}}),
              EX_OK;
     std::cout << cDim("（dry-run，不会真的提交）") << "\n" << head.dump() << "\n\n"
               << trim(md) << "\n";
@@ -501,7 +514,7 @@ int cmdGrpPost(const Args& a) {
     num = out["discussion"].value("number", 0L);
   std::string url = c.cfg.grpBase + "/blog.html?d=" + std::to_string(num);
   ok(cGreen("✓ 已发布") + (num ? " #" + std::to_string(num) : "") + "\n" + url,
-     nlohmann::json{{"number", num}, {"url", url}, {"title", title}, {"category_id", catId},
+     nlohmann::json{{"number", num}, {"url", url}, {"title", title}, {"category_id", catNum},
                     {"tags", tags}});
   return EX_OK;
 }
@@ -587,34 +600,184 @@ int cmdGrpDelete(const Args& a) {
   return EX_OK;
 }
 
-int cmdGrpStatus(const Args& a) {
-  (void)a;
+int cmdStatus(const Args& a) {
   Ctx c = makeCtx();
-  nlohmann::json j;
+  StatusSummary s;
   std::string err;
-  if (!grpStatus(c, j, err)) return fail(errCode(err), err);
-  auto svcs = j.value("services", nlohmann::json::array());
-  std::vector<std::vector<std::string>> rows;
-  nlohmann::json items = nlohmann::json::array();
-  for (auto& s : svcs) {
-    std::string level = s.value("level", s.value("ok", false) ? "up" : "down");
-    std::string label = level == "up" ? "正常" : (level == "slow" ? "偏慢" : "异常");
-    std::string ms = s.contains("ms") ? std::to_string(s.value("ms", 0)) + "ms" : "";
-    rows.push_back({s.value("short", s.value("name", "")), label, ms, s.value("err", "")});
-    items.push_back({{"id", s.value("id", "")},
-                     {"name", s.value("name", "")},
-                     {"level", level},
-                     {"ms", s.value("ms", 0)},
-                     {"ok", s.value("ok", false)},
-                     {"err", s.value("err", "")}});
+  if (!loadStatusSummary(c, s, err)) return fail(errCode(err), err);
+
+  long incN = a.num("incidents", 3);
+  bool hist = a.has("hist");
+
+  if (g.json) {
+    nlohmann::json svcs = nlohmann::json::array();
+    for (auto& v : s.svcs) {
+      nlohmann::json inc = nlohmann::json::array();
+      for (auto& x : v.incidents)
+        inc.push_back({{"from", x.from}, {"to", x.to}, {"minutes", (x.to - x.from) / 60000}});
+      svcs.push_back({{"id", v.id},          {"name", v.name},
+                      {"short", v.shortName}, {"group", v.group},
+                      {"level", v.level},     {"ok", v.ok},
+                      {"ms", v.ms},           {"err", v.err},
+                      {"h24_pct", v.h24pct},  {"h24_samples", v.h24n},
+                      {"h24_slow", v.h24slow},{"h24_down", v.h24down},
+                      {"d7_pct", v.d7pct},    {"d7_samples", v.d7n},
+                      {"bad_now", v.badNow},  {"since", v.sinceTs},
+                      {"last_up", v.lastUpTs},{"bad_count", v.badCount},
+                      {"incidents", inc}});
+    }
+    nlohmann::json week = nlohmann::json::array();
+    for (size_t i = 0; i < s.svcs.size(); i++)
+      week.push_back(s.week[i]);
+    return ok("", nlohmann::json{{"level", s.level},
+                                 {"updated", s.updatedMs},
+                                 {"interval_sec", s.intervalSec},
+                                 {"source", s.source},
+                                 {"days", s.days},
+                                 {"week", week},
+                                 {"services", svcs}}),
+           EX_OK;
   }
-  if (g.json) return ok("", nlohmann::json{{"updated", j.value("updated", 0L)},
-                                           {"interval_sec", j.value("intervalSec", 0)},
-                                           {"services", items}}),
-                     EX_OK;
-  printTable({"服务", "状态", "延迟", "备注"}, rows);
-  std::cout << cDim("\n数据更新于 " + isoToLocal(j.value("updatedAt", "")) + "，可在 " +
-                    c.cfg.grpBase + "/status 查看图形版") << "\n";
+
+  auto levelText = [](const std::string& lv) {
+    if (lv == "up") return std::string("正常");
+    if (lv == "slow") return std::string("偏慢");
+    if (lv == "partial") return std::string("部分异常");
+    return std::string("异常");
+  };
+  auto levelColor = [](const std::string& lv) {
+    if (lv == "up") return cGreen("正常");
+    if (lv == "slow") return cYellow("偏慢");
+    if (lv == "partial") return cYellow("部分异常");
+    return cRed("异常");
+  };
+  auto rateColor = [](double p) {
+    std::string t = fmtPct(p);
+    if (p < 0) return cDim(t);
+    if (p >= 99.95) return cGreen(t);
+    if (p >= 99) return cYellow(t);
+    return cRed(t);
+  };
+
+  std::cout << cBold("群档案 · 服务状态") << "   " << levelColor(s.level)
+            << cDim("  · 更新于 " + fmtLocalMs(s.updatedMs) + " · 每 " +
+                    std::to_string(s.intervalSec / 60) + " 分钟探测")
+            << "\n\n";
+
+  std::vector<std::vector<std::string>> rows;
+  for (auto& v : s.svcs) {
+    std::string state = levelText(v.level);
+    std::string ms = v.ms > 0 ? std::to_string(v.ms) + "ms" : "—";
+    std::string note = v.err;
+    if (v.badNow && v.sinceTs > 0)
+      note = "自 " + fmtLocalMs(v.sinceTs) + " 起异常（" + fmtDuration(v.sinceTs ? nowMs() - v.sinceTs : 0) + "）";
+    rows.push_back({cBold(v.shortName), state, ms, fmtPct(v.h24pct), fmtPct(v.d7pct), note});
+  }
+  printTable({"服务", "状态", "延迟", "24h", "7天", "备注"}, rows);
+
+  /* 近期故障段 */
+  std::vector<std::vector<std::string>> bad;
+  for (auto& v : s.svcs) {
+    int shown = 0;
+    for (auto& x : v.incidents) {
+      if (shown >= incN) break;
+      std::string from = fmtLocalMs(x.from), to = fmtLocalMs(x.to);
+      std::string dur = fmtDuration(x.to - x.from);
+      std::string tail = (x.to >= v.lastUpTs) ? "（持续中）" : "";
+      bad.push_back({v.shortName, from, to, dur, tail});
+      shown++;
+    }
+  }
+  if (!bad.empty() && incN > 0) {
+    std::cout << "\n" << cYellow("近期故障（近 24 小时）") << "\n";
+    printTable({"服务", "开始", "结束", "时长", ""}, bad);
+  } else if (incN > 0) {
+    std::cout << "\n" << cGreen("近 24 小时没有故障。") << "\n";
+  }
+
+  /* 近 7 天矩阵 */
+  if (hist) {
+    if (s.days.empty()) {
+      std::cout << "\n" << cDim("还没有按天的历史数据。") << "\n";
+    } else {
+      std::cout << "\n" << cYellow("近 7 天可用率") << cDim("（空格分隔，% ）") << "\n";
+      std::vector<std::vector<std::string>> w;
+      std::vector<std::string> head{"服务"};
+      for (auto& d : s.days) head.push_back(d.substr(5));
+      for (size_t i = 0; i < s.svcs.size(); i++) {
+        std::vector<std::string> row{s.svcs[i].shortName};
+        for (size_t d = 0; d < s.days.size(); d++) row.push_back(fmtPct(s.week[i][d]));
+        w.push_back(row);
+      }
+      printTable(head, w);
+    }
+  }
+
+  std::cout << "\n" << cDim("图形版：https://status.blacknet.cc.cd/") << "\n";
+  return EX_OK;
+}
+
+/* 按年月归档：bn grp archive [YYYY-MM]，不写参数则列出各月篇数 */
+int cmdGrpArchive(const Args& a) {
+  Ctx c = makeCtx();
+  std::string want = a.pos.empty() ? "" : trim(a.pos[0]);
+  long cap = a.num("limit", 500);
+
+  std::vector<nlohmann::json> posts;
+  std::string cursor;
+  std::string err;
+  while ((long)posts.size() < cap) {
+    nlohmann::json j;
+    if (!grpList(c, 100, cursor, j, err)) {
+      if (posts.empty()) return fail(errCode(err), err);
+      break;
+    }
+    auto nodes = j.value("nodes", nlohmann::json::array());
+    for (auto& d : nodes) posts.push_back(d);
+    if (!j.contains("pageInfo") || !j["pageInfo"].value("hasNextPage", false)) break;
+    cursor = j["pageInfo"].value("endCursor", "");
+    if (cursor.empty()) break;
+  }
+
+  std::map<std::string, std::vector<const nlohmann::json*>> byMonth;
+  for (auto& d : posts) {
+    std::string t = d.value("createdAt", "");
+    if (t.size() < 7) continue;
+    byMonth[t.substr(0, 7)].push_back(&d);
+  }
+
+  if (g.json) {
+    nlohmann::json out = nlohmann::json::object();
+    for (auto it = byMonth.rbegin(); it != byMonth.rend(); ++it) {
+      nlohmann::json arr = nlohmann::json::array();
+      for (auto* p : it->second)
+        arr.push_back({{"number", p->value("number", 0)},
+                       {"title", p->value("title", "")},
+                       {"created_at", p->value("createdAt", "")}});
+      out[it->first] = arr;
+    }
+    return ok("", out), EX_OK;
+  }
+
+  if (want.empty()) {
+    std::vector<std::vector<std::string>> rows;
+    for (auto it = byMonth.rbegin(); it != byMonth.rend(); ++it)
+      rows.push_back({it->first, std::to_string(it->second.size())});
+    printTable({"月份", "篇数"}, rows);
+    std::cout << cDim("\n看某个月：bn grp archive 2026-11") << "\n";
+    return EX_OK;
+  }
+
+  auto it = byMonth.find(want);
+  if (it == byMonth.end()) return fail(EX_NOTFOUND, "这个月没有文章：" + want, "notfound");
+  std::vector<std::vector<std::string>> rows;
+  for (auto* p : it->second) {
+    PostMeta m = parsePostBody(p->value("body", ""));
+    rows.push_back({padLeft(std::to_string(p->value("number", 0)), 4),
+                    m.hasCategory ? catName(m.category) : "—", p->value("title", ""),
+                    isoToLocal(p->value("createdAt", ""))});
+  }
+  printTable({"#", "分类", "标题", "时间"}, rows);
   return EX_OK;
 }
 
@@ -1117,6 +1280,232 @@ int cmdBookShelf(const Args& a) {
   return EX_OK;
 }
 
+/* 我的书：按登录账号过滤书阁索引 */
+int cmdBookMine(const Args& a) {
+  Ctx c = makeCtx();
+  std::string me = c.cfg.login;
+  if (me.empty()) me = trim(a.str("author"));
+  if (me.empty() && !c.token.empty()) {
+    HttpResponse r = c.http.get("https://api.github.com/user",
+                                {{"User-Agent", "BlackNet-CLI/1.0"},
+                                 {"Authorization", "Bearer " + c.token}});
+    if (r.ok()) {
+      try {
+        me = nlohmann::json::parse(r.body).value("login", "");
+      } catch (const std::exception&) {
+      }
+    }
+  }
+  if (me.empty())
+    return fail(EX_AUTH, "不知道你的账号：先 bn login，或用 --author <账号> 指定", "auth");
+
+  nlohmann::json idx;
+  std::string err;
+  if (!bookIndex(c, idx, err)) return fail(errCode(err), err);
+
+  std::vector<std::vector<std::string>> rows;
+  nlohmann::json items = nlohmann::json::array();
+  for (auto& b : idx.value("books", nlohmann::json::array())) {
+    std::string acc = b.value("account", "");
+    std::string author = b.value("author", "");
+    if (lowerAscii(acc) != lowerAscii(me) && lowerAscii(author) != lowerAscii(me)) continue;
+    std::string id = b.value("id", "");
+    auto cats = cleanCats(b);
+    std::string catText;
+    for (size_t i = 0; i < cats.size(); i++) catText += (i ? "、" : "") + cats[i];
+    rows.push_back({id, b.value("title", ""), catText.empty() ? "—" : catText,
+                    std::to_string(b.value("chapters", 0)), std::to_string(b.value("words", 0)),
+                    b.value("status", "ongoing") == "done" ? "完结" : "连载",
+                    b.value("visibility", "public") == "private" ? "私密" : "公开",
+                    isoToLocal(b.value("updatedAt", ""))});
+    items.push_back({{"id", id},
+                     {"title", b.value("title", "")},
+                     {"categories", cats},
+                     {"status", b.value("status", "ongoing")},
+                     {"visibility", b.value("visibility", "public")},
+                     {"chapters", b.value("chapters", 0)},
+                     {"words", b.value("words", 0)},
+                     {"updated_at", b.value("updatedAt", "")},
+                     {"url", c.cfg.bookBase + "/book.html?id=" + id}});
+  }
+  if (g.json) return ok("", nlohmann::json{{"author", me}, {"items", items}}), EX_OK;
+  if (rows.empty()) return ok(cDim(me + " 名下还没有书。")), EX_OK;
+  std::cout << cBold(me) << cDim(" 的书（" + std::to_string(rows.size()) + " 本）") << "\n";
+  printTable({"书号", "书名", "分类", "章", "字数", "状态", "可见", "更新"}, rows);
+  return EX_OK;
+}
+
+/* 云端草稿（/api/works）：换设备接着写 */
+static std::vector<std::string> listMdFiles(const std::string& dir) {
+  std::vector<std::string> files;
+  WIN32_FIND_DATAW fd;
+  std::wstring pat = utf8ToWide(dir + "\\*.md");
+  HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        files.push_back(utf8ToWideLossless(fd.cFileName));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
+int cmdBookDrafts(const Args& a) {
+  Ctx c = makeCtx();
+  if (!requireToken(c)) return EX_AUTH;
+
+  std::string sub = a.pos.empty() ? "list" : a.pos[0];
+  std::string id = a.pos.size() > 1 ? a.pos[1] : a.str("id");
+  std::string err;
+
+  /* 目录 → 推送到云端 */
+  auto pushDir = [&](const std::string& dir) -> int {
+    std::string metaRaw = readFile(dir + "\\meta.json");
+    nlohmann::json meta = nlohmann::json::object();
+    if (!metaRaw.empty()) {
+      try {
+        meta = nlohmann::json::parse(metaRaw);
+      } catch (const std::exception&) {
+        return fail(EX_USAGE, "meta.json 不是合法 JSON：" + dir);
+      }
+    }
+    std::string bid = a.str("id", meta.value("id", id));
+    if (bid.empty()) bid = newBookId();
+    meta["id"] = bid;
+
+    auto files = listMdFiles(dir);
+    if (files.empty()) return fail(EX_USAGE, "目录里没有 .md：" + dir);
+    nlohmann::json chapters = nlohmann::json::array();
+    int n = 0;
+    for (auto& f : files) {
+      n++;
+      std::string title = f;
+      size_t dot = title.rfind(".md");
+      if (dot != std::string::npos) title = title.substr(0, dot);
+      size_t dash = title.find('-');
+      if (dash != std::string::npos && dash + 1 < title.size()) title = title.substr(dash + 1);
+      chapters.push_back({{"id", "c" + std::to_string(n)},
+                          {"title", title},
+                          {"content", readFile(dir + "\\" + f)}});
+    }
+    nlohmann::json book{{"id", bid}, {"meta", meta}, {"chapters", chapters}};
+    nlohmann::json out;
+    if (!bookWorksSave(c, book, out, err)) return fail(errCode(err), "推送草稿失败：" + err);
+    if (g.json) return ok("", out), EX_OK;
+    std::cout << cGreen("✓ 已推送 ") << bid << cDim("（" + std::to_string(n) + " 章，" +
+                                                    std::to_string(out.value("chunks", 1)) +
+                                                    " 块，服务端 " +
+                                                    std::to_string(out.value("bytes", 0)) + " 字节）")
+              << "\n";
+    return EX_OK;
+  };
+
+  /* 目录检测：drafts <目录> 直接当 push */
+  if (!sub.empty()) {
+    std::wstring w = utf8ToWide(sub);
+    DWORD attr = GetFileAttributesW(w.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return pushDir(sub);
+  }
+
+  if (sub == "list" || sub == "ls") {
+    nlohmann::json j;
+    if (!bookWorksList(c, j, err)) return fail(errCode(err), err);
+    auto books = j.value("books", nlohmann::json::array());
+    if (g.json) return ok("", j), EX_OK;
+    if (books.empty()) return ok(cDim("云端没有草稿。用 bn book drafts <目录> 推一本上去。")), EX_OK;
+    std::vector<std::vector<std::string>> rows;
+    for (auto& b : books) {
+      rows.push_back({b.value("id", ""), b.value("title", ""),
+                      std::to_string(b.value("chapters", 0)),
+                      std::to_string(b.value("words", 0)),
+                      std::to_string(b.value("chunks", 1)),
+                      b.contains("published") && !b["published"].is_null() ? "已发布" : "未发布",
+                      isoToLocal(b.value("updatedAt", b.value("at", "")))});
+    }
+    printTable({"书号", "书名", "章", "字数", "块", "状态", "更新"}, rows);
+    return EX_OK;
+  }
+
+  if (sub == "push") {
+    if (id.empty()) return fail(EX_USAGE, "用法：bn book drafts push <目录> [--id bk_xxx]");
+    return pushDir(id);
+  }
+
+  if (sub == "pull" || sub == "get") {
+    if (id.empty()) return fail(EX_USAGE, "用法：bn book drafts pull <书号> [-o 目录]");
+    nlohmann::json j;
+    if (!bookWorksGet(c, id, j, err)) {
+      if (err.find("404") != std::string::npos)
+        return fail(EX_NOTFOUND, "云端没有这本书的草稿：" + id, "notfound");
+      return fail(errCode(err), err);
+    }
+    if (!j.contains("book") || !j["book"].is_object())
+      return fail(EX_FAIL, "云端返回里没有 book");
+    auto book = j["book"];
+    auto meta = book.value("meta", nlohmann::json::object());
+    auto chapters = book.value("chapters", nlohmann::json::array());
+    std::string dir = a.str("out", id);
+    MakeSureDir(dir);
+    meta["cli_pulled_at"] = nowIso();
+    writeFile(dir + "\\meta.json", meta.dump(2) + "\n");
+    nlohmann::json list = nlohmann::json::array();
+    int n = 0;
+    for (auto& ch : chapters) {
+      n++;
+      char pre[16];
+      snprintf(pre, sizeof(pre), "%04d-", n);
+      std::string name = std::string(pre) + safeName(ch.value("title", "untitled")) + ".md";
+      writeFile(dir + "\\" + name, ch.value("content", ""));
+      list.push_back({{"index", n}, {"file", name}, {"title", ch.value("title", "")}});
+    }
+    if (g.json)
+      return ok("", nlohmann::json{{"dir", dir}, {"id", id}, {"chapters", list},
+                                   {"words", meta.value("words", 0)}}),
+             EX_OK;
+    std::cout << cGreen("✓ 已拉取 ") << meta.value("title", id) << " → " << dir
+              << cDim("（" + std::to_string(n) + " 章）") << "\n";
+    return EX_OK;
+  }
+
+  if (sub == "show") {
+    if (id.empty()) return fail(EX_USAGE, "用法：bn book drafts show <书号>");
+    nlohmann::json j;
+    if (!bookWorksGet(c, id, j, err)) return fail(errCode(err), err);
+    auto book = j.value("book", nlohmann::json::object());
+    auto meta = book.value("meta", nlohmann::json::object());
+    auto chapters = book.value("chapters", nlohmann::json::array());
+    if (g.json) return ok("", j), EX_OK;
+    std::cout << cBold(meta.value("title", id)) << cDim("  " + id) << "\n";
+    std::cout << cDim("作者 " + meta.value("author", "—") + " · " +
+                      std::to_string(chapters.size()) + " 章 · " +
+                      std::to_string(meta.value("words", 0)) + " 字 · 更新 " +
+                      isoToLocal(book.value("at", "")))
+              << "\n";
+    if (!meta.value("intro", "").empty()) std::cout << "\n" << cYellow("简介：" + meta.value("intro", "")) << "\n";
+    std::cout << "\n";
+    std::vector<std::vector<std::string>> rows;
+    int n = 0;
+    for (auto& ch : chapters)
+      rows.push_back({padLeft(std::to_string(++n), 4), ch.value("title", "")});
+    printTable({"#", "章节"}, rows);
+    return EX_OK;
+  }
+
+  if (sub == "rm" || sub == "delete") {
+    if (id.empty()) return fail(EX_USAGE, "用法：bn book drafts rm <书号> -y");
+    if (!confirm("删除云端草稿 " + id + "？不可恢复。", a.has("yes"))) return EX_FAIL;
+    nlohmann::json out;
+    if (!bookWorksDelete(c, id, out, err)) return fail(errCode(err), err);
+    ok(cGreen("✓ 已删除云端草稿 ") + id, out);
+    return EX_OK;
+  }
+
+  return fail(EX_USAGE, "未知子命令：bn book drafts " + sub + "（list / show / pull / push / rm）");
+}
+
+
 }  // namespace
 }  // namespace bn
 
@@ -1142,6 +1531,8 @@ int main(int argc, char** argv) {
   }
 
   if (argc < 2) {
+    // 交互式终端直接进 TUI；被脚本/管道调用时仍然只打印用法（agent 友好）
+    if (stdoutIsTty()) return cmdTui();
     printHelp();
     return EX_USAGE;
   }
@@ -1163,15 +1554,24 @@ int main(int argc, char** argv) {
     return EX_OK;
   }
   if (domain == "--version" || domain == "version" || domain == "-V") {
-    std::cout << "bn 0.1.0\n";
+    std::cout << "bn " << kVersion << "\n";
     return EX_OK;
   }
 
   Args a = argc > 3 ? parseArgs(argc - 3, argv + 3) : Args{};
+  // 一级命令（bn status --hist）的参数从 index 2 开始
+  Args a1 = argc > 2 ? parseArgs(argc - 2, argv + 2) : Args{};
 
   if (domain == "login" || domain == "auth") return cmdLogin(parseArgs(argc - 1, argv + 1));
   if (domain == "logout") return cmdLogout(a);
   if (domain == "whoami") return cmdWhoami(a);
+  if (domain == "tui" || domain == "ui" || domain == "term") {
+    if (a1.has("dump"))
+      return cmdTuiDump(a1.str("dump", "tui-dump.txt"), (int)a1.num("width", 120),
+                        (int)a1.num("height", 40));
+    return cmdTui();
+  }
+  if (domain == "status" || domain == "st") return cmdStatus(a1);
 
   if (domain == "grp") {
     if (cmd.empty() || cmd == "-h" || cmd == "--help" || cmd == "help") { printGrpHelp(); return EX_OK; }
@@ -1183,7 +1583,8 @@ int main(int argc, char** argv) {
     if (cmd == "react" || cmd == "reaction") return cmdGrpReact(a);
     if (cmd == "upvote" || cmd == "like") return cmdGrpUpvote(a);
     if (cmd == "delete" || cmd == "rm") return cmdGrpDelete(a);
-    if (cmd == "status") return cmdGrpStatus(a);
+    if (cmd == "status" || cmd == "st") return cmdStatus(a);
+    if (cmd == "archive" || cmd == "months") return cmdGrpArchive(a);
     if (cmd == "feed" || cmd == "rss") return cmdGrpFeed(a);
     return fail(EX_USAGE, "未知命令：bn grp " + cmd);
   }
@@ -1199,6 +1600,8 @@ int main(int argc, char** argv) {
     if (cmd == "publish" || cmd == "push") return cmdBookPublish(a);
     if (cmd == "collections" || cmd == "col") return cmdBookCollections(a);
     if (cmd == "shelf") return cmdBookShelf(a);
+    if (cmd == "mine" || cmd == "my") return cmdBookMine(a);
+    if (cmd == "drafts" || cmd == "draft") return cmdBookDrafts(a);
     return fail(EX_USAGE, "未知命令：bn book " + cmd);
   }
 

@@ -59,7 +59,42 @@ bn logout
 
 ---
 
-## 三、主站 grp
+## 三、全屏界面（只认键盘）
+
+命令行适合「一次一件事」，要看要读要翻的时候，直接输 `bn` 进全屏界面：
+
+```cmd
+bn
+```
+
+| 键 | 作用 |
+|---|---|
+| `Tab` / `Shift+Tab` | 切换 主站 / 书阁 / 状态 / 帮助 |
+| `1` `2` `3` `4` | 直接跳页 |
+| `↑` `↓` / `j` `k` | 选择；详情页里是滚动 |
+| `Enter` | 打开文章 / 选书 / 读这一章 |
+| `Esc` | 返回上一级 |
+| `/` | 搜索（主站搜标题，书阁搜书名作者）|
+| `c` | 列表页切换分类；文章页写评论 |
+| `s` / `a` | 切排序（默认 / 最新 / 点赞）/ 升降序 |
+| `u` | 给当前文章点赞 |
+| `r` | 重新读取当前页 |
+| `q` / `Ctrl+C` | 退出 |
+
+**只处理键盘事件**：程序创建输入句柄后不再申请鼠标事件，鼠标点击、拖拽、滚轮都不会有反应。
+所有网络请求都在后台线程，按键永远不会被卡住。
+
+非交互终端（管道、CI）里 `bn` 只打印用法，不会尝试进全屏——agent 调命令时不会卡住。
+
+想把界面排版当文本检查（不打开窗口）：
+
+```cmd
+bn tui --dump layout.txt --width 120 --height 40
+```
+
+---
+
+## 四、主站 grp
 
 ```cmd
 bn grp list                          :: 最新 20 篇
@@ -68,9 +103,29 @@ bn grp list --after <游标>            :: 翻页（游标由上一条命令输�
 bn grp show 48                       :: 看一篇
 bn grp show 48 --comments 20         :: 连带 20 条评论
 bn grp search 状态页 -n 50            :: 标题/正文/简介里搜（会翻多页）
-bn grp status                        :: 各服务当前状态
+bn grp list --sort likes -n 10       :: 按点赞排（自动多取几页再排）
+bn grp list --sort updated --asc     :: 按修改时间、升序
+bn grp list --tag CLI --all          :: 按标签过滤，全部输出
+bn grp archive                       :: 各月篇数
+bn grp archive 2026-11               :: 某个月的文章
 bn grp feed -n 20                    :: 最新文章 RSS
 ```
+
+排序与网页一致：`default`（公告置顶 + 时间倒序）/ `created` / `updated` / `likes`；
+公告只在默认排序里置顶，`--asc` 时沉到最后。网页是前端排序，CLI 也一样——加 `--sort`
+会自动多翻几页再排，`--all` 翻到第 500 篇为止。
+
+### 服务状态
+
+```cmd
+bn status                            :: 当前状态 + 24h/7 天可用率 + 近期故障段
+bn status --hist                     :: 再加近 7 天逐日矩阵
+bn status --incidents 5              :: 每个服务列 5 条故障段（默认 3）
+bn status --json                     :: 全量数据（含 hist 算出的可用率、故障段起止）
+```
+
+和 <https://status.blacknet.cc.cd/> 同一份数据、同一套算法：相邻故障段空档 ≤ 10 分钟合并成一段，
+可用率按探测点算，样本不足 5 次的当天不给百分比。
 
 ### 发稿
 
@@ -110,7 +165,7 @@ bn grp delete 48                   :: 删除自己的文章（不可恢复，-y 
 
 ---
 
-## 四、书阁 book
+## 五、书阁 book
 
 ```cmd
 bn book list
@@ -163,15 +218,32 @@ bn book collections create --title "改名" --id cl_xxx --books bk_a,bk_b
 bn book collections delete cl_xxx -y
 ```
 
-### 书架
+### 书架 / 我的作品
 
 ```cmd
 bn book shelf        :: 云端收藏 + 阅读进度
+bn book mine         :: 我名下的书（按登录账号；--author 看别人）
 ```
+
+### 云端草稿（换台机器接着写）
+
+书阁网页的编辑器会把稿子同步到云端。CLI 能直接拉下来、改完再推回去，
+目录格式和 `pack` / `unpack` 完全一样（`meta.json` + `NNNN-标题.md`）：
+
+```cmd
+bn book drafts                        :: 云端草稿列表
+bn book drafts show bk_xxx            :: 看目录结构
+bn book drafts pull bk_xxx -o ./work  :: 拉到本地
+bn book drafts push ./work            :: 改完推回去（同名覆盖）
+bn book drafts push ./work --id bk_x  :: 从零新建一本草稿
+bn book drafts rm bk_xxx -y           :: 删掉云端草稿
+```
+
+草稿走 `bu:<uid>:books`，只有本人能读到，和网页是同一份数据。
 
 ---
 
-## 五、给 agent 用
+## 六、给 agent 用
 
 ### 机器可读输出
 
@@ -217,7 +289,7 @@ bn book publish ./book --json                :: 发书并拿到 id/url
 
 ---
 
-## 六、实现说明
+## 七、实现说明
 
 ```
 cli/
@@ -226,8 +298,11 @@ cli/
   src/crypto.*    BCrypt：随机数、PBKDF2-SHA256、AES-256-GCM；DPAPI 存令牌
   src/bookfile.*  .book 格式（与 book/assets/js/core/crypto.js 逐字段同构）
   src/api.*       grp / book 接口（含同源 → jsDelivr → raw 三层兜底）
+  src/posts.*     正文首行 JSON 与分类映射（CLI / TUI 共用）
+  src/statusview.* 状态页可用率与故障段计算（CLI / TUI 共用）
   src/config.*    配置与令牌
   src/ui.*        表格、颜色、JSON 输出、退出码
+  src/tty.*       全屏界面（控制台双缓冲 + 后台线程取数）
   src/main.cpp    命令分发
   tools/          verify-book.mjs（用站点同款 WebCrypto 校验 .book）、mock-server.mjs（本地假后端）
   third_party/    nlohmann/json 单头文件

@@ -255,6 +255,15 @@ std::string replaceAll(std::string s, const std::string& from, const std::string
 }
 
 /* ================= 时间 ================= */
+int64_t nowMs() {
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  ULARGE_INTEGER u;
+  u.LowPart = ft.dwLowDateTime;
+  u.HighPart = ft.dwHighDateTime;
+  return (int64_t)((u.QuadPart - 116444736000000000ULL) / 10000ULL);
+}
+
 std::string nowIso() {
   SYSTEMTIME st;
   GetSystemTime(&st);

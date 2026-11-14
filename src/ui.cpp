@@ -1,5 +1,7 @@
 #include "ui.h"
 
+#include "version.h"
+
 #include <windows.h>
 
 #include <algorithm>
@@ -92,9 +94,9 @@ void ok(const std::string& human, const nlohmann::json& data) {
 
 void printHelp() {
   std::cout <<
-      "bn — 群档案 / 群书阁 命令行客户端  v0.1.0\n"
+      "bn — 群档案 / 群书阁 终端客户端  v" + std::string(kVersion) + "\n"
       "\n"
-      "用法：bn <域> <命令> [参数...]\n"
+      "用法：bn <域> <命令> [参数...]      直接输 bn 进全屏界面（纯键盘）\n"
       "\n"
       "全局参数：--json 机器可读输出 · --no-color 关颜色 · -v 显示请求细节 · -y 跳过确认\n"
       "\n"
@@ -104,7 +106,8 @@ void printHelp() {
       "  bn logout                              清除本机令牌\n"
       "\n"
       "主站 grp（grp.blacknet.cc.cd）\n"
-      "  bn grp list [-n 20] [--after CURSOR] [--cat 分类]\n"
+      "  bn grp list [-n 20] [--after CURSOR] [--cat 分类] [--tag 标签]\n"
+      "             [--sort default|created|updated|likes] [--asc] [--all]\n"
       "  bn grp show <编号> [--comments N]\n"
       "  bn grp search <关键词> [-n 50]\n"
       "  bn grp post -t 标题 -f 正文.md [--cat 技术] [--tags a,b] [--info 简介] [--dry]\n"
@@ -112,8 +115,9 @@ void printHelp() {
       "  bn grp react <编号> <表情> [--remove]\n"
       "  bn grp upvote <编号> [--remove]\n"
       "  bn grp delete <编号>                   删除文章（不可恢复）\n"
-      "  bn grp status                          服务状态\n"
+      "  bn status [--hist] [--incidents N]     服务状态：当前 + 24h/7 天可用率 + 故障段\n"
       "  bn grp feed [-n 20]                    最新文章 RSS\n"
+      "  bn grp archive [YYYY-MM]               按月归档（不写参数列各月篇数）\n"
       "\n"
       "书阁 book（book.blacknet.cc.cd）\n"
       "  bn book list [--cat 分类] [--status done|ongoing] [--q 关键词]\n"
@@ -125,6 +129,13 @@ void printHelp() {
       "  bn book publish <文件.book|目录> [--meta meta.json] [--dry]\n"
       "  bn book collections [list | show <id> | create | delete <id>]\n"
       "  bn book shelf                          云端书架\n"
+      "  bn book mine                           我名下的书（按登录账号）\n"
+      "  bn book drafts [ls|show|pull|push|rm]  云端草稿：换台机器接着写\n"
+      "\n"
+      "全屏界面（只认键盘）\n"
+      "  bn                                    进入界面：主站 / 书阁 / 状态 / 帮助\n"
+      "  bn tui                                同上（明确指定）\n"
+      "  Tab 切换页 · ↑↓ 选择 · Enter 打开 · / 搜索 · c 分类 · s 排序 · r 刷新 · q 退出\n"
       "\n"
       "示例：\n"
       "  bn login\n"
@@ -147,8 +158,12 @@ void printGrpHelp() {
       "  react    表情反应：+1/-1/laugh/hooray/confused/heart/rocket/eyes\n"
       "  upvote   点赞 / --remove 取消\n"
       "  delete   删除自己的文章（不可恢复，-y 跳过确认）\n"
-      "  status   服务状态\n"
-      "  feed     最新文章 RSS\n";
+      "  status   服务状态（= bn status，含可用率与故障段）\n"
+      "  archive  按月归档：bn grp archive 2026-11\n"
+      "  feed     最新文章 RSS\n"
+      "\n"
+      "list 的排序在主站网页上是前端做的，CLI 也一样：加 --sort 会自动多取几页再排，\n"
+      "公告在默认排序下置顶（--asc 时排到最后）。\n";
 }
 
 void printBookHelp() {
@@ -162,7 +177,10 @@ void printBookHelp() {
       "  pack/unpack  .book 与「目录 + Markdown」互转\n"
       "  publish      发布/更新（.book 或目录均可，自动分片上传）\n"
       "  collections  作品集：list / show / create / delete\n"
-      "  shelf        云端书架（需登录）\n";
+      "  shelf        云端书架（需登录）\n"
+      "  mine         我名下的书（--author 指定别人）\n"
+      "  drafts       云端草稿：list / show <书号> / pull <书号> [-o 目录]\n"
+      "               drafts push <目录> [--id 书号] / rm <书号> -y\n";
 }
 
 }  // namespace bn

@@ -300,4 +300,32 @@ bool bookShelf(Ctx& c, nlohmann::json& out, std::string& err) {
   return httpJson(c, c.cfg.bookBase + "/api/shelf", out, err);
 }
 
+bool bookWorksList(Ctx& c, nlohmann::json& out, std::string& err) {
+  return httpJson(c, c.cfg.bookBase + "/api/works", out, err);
+}
+
+bool bookWorksGet(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err) {
+  return httpJson(c, c.cfg.bookBase + "/api/works?id=" + id, out, err);
+}
+
+bool bookWorksSave(Ctx& c, const nlohmann::json& book, nlohmann::json& out, std::string& err) {
+  return httpPostJson(c, c.cfg.bookBase + "/api/works", nlohmann::json{{"book", book}}, out, err);
+}
+
+bool bookWorksDelete(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err) {
+  HttpResponse r = c.http.del(c.cfg.bookBase + "/api/works?id=" + id, authHeaders(c));
+  if (!r.error.empty()) { err = "网络错误：" + r.error; return false; }
+  try {
+    out = nlohmann::json::parse(r.body);
+  } catch (const std::exception&) {
+    err = "响应不是 JSON（HTTP " + std::to_string(r.status) + "）";
+    return false;
+  }
+  if (r.status < 200 || r.status >= 300) {
+    err = apiErrText(r) + "（HTTP " + std::to_string(r.status) + "）";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace bn

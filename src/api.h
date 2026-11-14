@@ -55,5 +55,10 @@ bool bookCollections(Ctx& c, nlohmann::json& out, std::string& err);
 bool bookCollectionSave(Ctx& c, const nlohmann::json& col, nlohmann::json& out, std::string& err);
 bool bookCollectionDelete(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err);
 bool bookShelf(Ctx& c, nlohmann::json& out, std::string& err);
+// 云端草稿（换设备接着写）：/api/works
+bool bookWorksList(Ctx& c, nlohmann::json& out, std::string& err);
+bool bookWorksGet(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err);
+bool bookWorksSave(Ctx& c, const nlohmann::json& book, nlohmann::json& out, std::string& err);
+bool bookWorksDelete(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err);
 
 }  // namespace bn

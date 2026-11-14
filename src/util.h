@@ -31,6 +31,7 @@ bool endsWith(const std::string& s, const std::string& p);
 std::string replaceAll(std::string s, const std::string& from, const std::string& to);
 
 /* ---------------- 时间 ---------------- */
+int64_t nowMs();                       // 当前毫秒时间戳
 std::string nowIso();                    // 2026-11-14T13:00:00.000Z
 std::string nowLocalHuman();             // 2026-11-14 13:00:00
 std::string isoToLocal(const std::string& iso);
