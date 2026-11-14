@@ -67,6 +67,74 @@ int measureWide(HANDLE out) {
   SetConsoleCursorPosition(out, save);
   return (w == 1 || w == 2) ? w : 2;
 }
+/* 向终端本身要真实可见尺寸。
+   ConPTY 下 GetConsoleScreenBufferInfo 给的 srWindow 有时是 conhost 自己的旧值，
+   和 Windows Terminal 真正的可见列数不一致 —— 界面就会右侧被切。
+   这里用 ESC[18t 问一次，终端会回 ESC[8;行;列t。问不到就返回 false，退回老办法。 */
+bool queryTermSize(HANDLE hin, HANDLE hout, int& cols, int& rows) {
+  DWORD oldIn = 0, oldOut = 0;
+  if (!GetConsoleMode(hin, &oldIn) || !GetConsoleMode(hout, &oldOut)) return false;
+  SetConsoleMode(hin, (oldIn | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~ENABLE_PROCESSED_INPUT);
+  SetConsoleMode(hout, oldOut | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  const char req[] = "\x1b[18t";
+  DWORD n = 0;
+  WriteFile(hout, req, sizeof(req) - 1, &n, nullptr);
+
+  bool ok = false;
+  std::string buf;
+  DWORD t0 = GetTickCount();
+  while (GetTickCount() - t0 < 150) {
+    DWORD avail = 0;
+    if (!GetNumberOfConsoleInputEvents(hin, &avail) || avail == 0) {
+      Sleep(10);
+      continue;
+    }
+    INPUT_RECORD rec;
+    DWORD got = 0;
+    if (!ReadConsoleInputW(hin, &rec, 1, &got) || got == 0) break;
+    if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
+    wchar_t c = rec.Event.KeyEvent.uChar.UnicodeChar;
+    if (c >= 32 && c < 128) buf += (char)c;
+    size_t p = buf.find("[8;");
+    if (p != std::string::npos && buf.size() >= p + 4) {
+      int r = 0, cc = 0;
+      if (sscanf_s(buf.c_str() + p, "[8;%d;%dt", &r, &cc) == 2 && r > 0 && cc > 0) {
+        rows = r;
+        cols = cc;
+        ok = true;
+        break;
+      }
+    }
+    if (buf.size() > 96) buf.erase(0, 48);
+  }
+  SetConsoleMode(hin, oldIn);
+  SetConsoleMode(hout, oldOut);
+  return ok;
+}
+
+/* 让「窗口」和「缓冲区」是同一个矩形。
+   不对齐的话，用户把窗口拉窄/拉矮之后控制台会横向或纵向滚动，srWindow 的 Left/Top 不再是 0，
+   整个界面就整体偏移、右边被切掉（1.0.0 的截断就是这样来的）。 */
+bool alignBuffer(HANDLE out, COORD want) {
+  if (want.X < 20) want.X = 20;
+  if (want.Y < 8) want.Y = 8;
+  CONSOLE_SCREEN_BUFFER_INFO ci;
+  if (!GetConsoleScreenBufferInfo(out, &ci)) return false;
+  if (ci.dwSize.X == want.X && ci.dwSize.Y == want.Y && ci.srWindow.Left == 0 &&
+      ci.srWindow.Top == 0)
+    return true;
+  SMALL_RECT one{0, 0, 0, 0};
+  SetConsoleWindowInfo(out, TRUE, &one);          // 先把窗口缩到 1x1，缓冲区才允许缩小
+  if (!SetConsoleScreenBufferSize(out, want)) {   // 有的终端不让改，退回原样
+    SMALL_RECT back{0, 0, (SHORT)std::min<int>(ci.dwSize.X - 1, ci.srWindow.Right - ci.srWindow.Left),
+                    (SHORT)std::min<int>(ci.dwSize.Y - 1, ci.srWindow.Bottom - ci.srWindow.Top)};
+    SetConsoleWindowInfo(out, TRUE, &back);
+    return false;
+  }
+  SMALL_RECT full{0, 0, (SHORT)(want.X - 1), (SHORT)(want.Y - 1)};
+  return SetConsoleWindowInfo(out, TRUE, &full);
+}
+
 int wstrWidth(const std::wstring& s) {
   int w = 0;
   for (wchar_t c : s) w += wcWidth(c);
@@ -124,11 +192,14 @@ std::vector<std::wstring> wrapText(const std::string& utf8, int width) {
 /* ================= 画布 ================= */
 class Canvas {
  public:
-  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci) {
+  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci, int maxW = 0, int maxH = 0) {
     out_ = out;
     origin_ = COORD{ci.srWindow.Left, ci.srWindow.Top};  // 画布原点 = 窗口左上角
     W_ = ci.srWindow.Right - ci.srWindow.Left + 1;
     H_ = ci.srWindow.Bottom - ci.srWindow.Top + 1;
+    // 终端自报的可见尺寸比 conhost 的更可信：宁可少画，也别画到屏幕外面去
+    if (maxW > 0 && maxW < W_) W_ = maxW;
+    if (maxH > 0 && maxH < H_) H_ = maxH;
     if (W_ < 20) W_ = 20;
     if (H_ < 8) H_ = 8;
     buf_.assign((size_t)W_ * H_, CHAR_INFO{L' ', A_NORM});
@@ -146,7 +217,9 @@ class Canvas {
       int cw = wcWidth(ch);
       if (cw == 0) continue;
       if (x + cw > end) break;
+      if (x < 0) { x += cw; continue; }        // 右对齐时宽度不够，别写到缓冲区外
       buf_[(size_t)y * W_ + x] = CHAR_INFO{ch, attr};
+      if (cw == 2 && x + 1 < W_) buf_[(size_t)y * W_ + x + 1] = CHAR_INFO{0, attr};
       x += cw;
     }
   }
@@ -237,6 +310,7 @@ class App {
   void kick(std::function<void()> fn, const char* what);
   void poll();
   void applyStage();
+  bool checkSize();     // 窗口/缓冲区变了就重新对齐并返回 true
   Ctx ctx() const;
 
   void loadGrp();
@@ -306,6 +380,10 @@ class App {
 
   bool headless_ = false;
   int fakeW_ = 120, fakeH_ = 40;
+  COORD oldBuf_{0, 0};        // 进界面前的缓冲区尺寸，退出时还原
+  bool aligned_ = false;      // 成功把窗口与缓冲区对齐过
+  int lastW_ = 0, lastH_ = 0; // 上一帧的可见尺寸，用来感知窗口变化
+  int termW_ = 0, termH_ = 0; // 终端自报的可见尺寸（VT 查询），0 = 没问到
 };
 
 Ctx App::ctx() const {
@@ -367,6 +445,22 @@ bool App::init() {
   SetConsoleCursorInfo(hout_, &ci);
 
   SetConsoleTitleW(L"bn · BlackNet Terminal");
+
+  CONSOLE_SCREEN_BUFFER_INFO ci0;
+  if (GetConsoleScreenBufferInfo(hout_, &ci0)) {
+    oldBuf_ = ci0.dwSize;
+    COORD vp{(SHORT)(ci0.srWindow.Right - ci0.srWindow.Left + 1),
+             (SHORT)(ci0.srWindow.Bottom - ci0.srWindow.Top + 1)};
+    aligned_ = alignBuffer(hout_, vp);
+    lastW_ = vp.X;
+    lastH_ = vp.Y;
+  }
+  if (queryTermSize(hin_, hout_, termW_, termH_)) {
+    if (termW_ < 20 || termH_ < 8) { termW_ = 0; termH_ = 0; }
+  } else {
+    termW_ = 0;
+    termH_ = 0;
+  }
   g_wideW = measureWide(hout_);
   cfg_ = loadConfig();
   me_ = cfg_.login;
@@ -385,6 +479,18 @@ void App::shutdown() {
     DWORD n = 0;
     FillConsoleOutputCharacterW(hout_, L' ', (DWORD)info.dwSize.X * info.dwSize.Y, home, &n);
     SetConsoleCursorPosition(hout_, home);
+    // 把缓冲区尺寸还回去，用户退出后滚回历史才对得上
+    if (aligned_ && oldBuf_.X > 0 && oldBuf_.Y > 0 &&
+        (oldBuf_.X != info.dwSize.X || oldBuf_.Y != info.dwSize.Y)) {
+      COORD cur{info.dwSize.X, info.dwSize.Y};
+      COORD back{(SHORT)std::max<int>(oldBuf_.X, cur.X), (SHORT)std::max<int>(oldBuf_.Y, cur.Y)};
+      SMALL_RECT one{0, 0, 0, 0};
+      SetConsoleWindowInfo(hout_, TRUE, &one);
+      SetConsoleScreenBufferSize(hout_, back);
+      SMALL_RECT full{0, 0, (SHORT)(info.srWindow.Right - info.srWindow.Left),
+                      (SHORT)(info.srWindow.Bottom - info.srWindow.Top)};
+      SetConsoleWindowInfo(hout_, TRUE, &full);
+    }
   }
   ready_ = false;
 }
@@ -868,6 +974,8 @@ std::vector<Row> App::rowsHelp(int width) {
       "  私密书请用命令行：bn book show <书号> --password 口令",
   };
   std::vector<Row> out;
+  int cw2 = headless_ ? fakeW_ : (termW_ > 0 ? termW_ : lastW_);
+  int ch2 = headless_ ? fakeH_ : (termH_ > 0 ? termH_ : lastH_);
   for (auto& l : kLines) {
     std::string s = l;
     WORD a = A_NORM;
@@ -876,6 +984,12 @@ std::vector<Row> App::rowsHelp(int width) {
     else if (isHead) a = A_ACC;
     out.push_back({truncateTo(WW(s), width), a, false});
   }
+  if (cw2 > 0)
+    out.push_back(
+        {WW("  当前界面 " + std::to_string(cw2) + "×" + std::to_string(ch2) +
+            " 格。汉字按 2 格排版；若字与字之间看着有缝，是终端字体没有等宽 CJK 字形"
+            "（换成更纱黑体 / Maple Mono NF 之类会整）"),
+         A_DIM, false});
   return out;
 }
 
@@ -895,7 +1009,7 @@ void App::draw() {
   CONSOLE_SCREEN_BUFFER_INFO ci;
   if (!GetConsoleScreenBufferInfo(hout_, &ci)) return;
   Canvas cv;
-  cv.begin(hout_, ci);
+  cv.begin(hout_, ci, termW_, termH_);
   const int W = cv.w(), H = cv.h();
   cv.clear();
 
@@ -982,9 +1096,9 @@ void App::draw() {
       ReadConsoleOutputW(hout_, all.data(), sz, pz, &rr);
       std::string dump;
       char head[128];
-      snprintf(head, sizeof(head), "buffer=%dx%d win=(%d,%d)-(%d,%d)\n", cb2.dwSize.X,
+      snprintf(head, sizeof(head), "buffer=%dx%d win=(%d,%d)-(%d,%d) term=%dx%d canvas=%dx%d wide=%d\n", cb2.dwSize.X,
                cb2.dwSize.Y, cb2.srWindow.Left, cb2.srWindow.Top, cb2.srWindow.Right,
-               cb2.srWindow.Bottom);
+               cb2.srWindow.Bottom, termW_, termH_, W, H, g_wideW);
       dump += head;
       for (int y = 0; y < H; y++) {
         std::wstring line;
@@ -1219,6 +1333,29 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
   }
 }
 
+bool App::checkSize() {
+  if (headless_) return false;
+  CONSOLE_SCREEN_BUFFER_INFO ci;
+  if (!GetConsoleScreenBufferInfo(hout_, &ci)) return false;
+  int w = ci.srWindow.Right - ci.srWindow.Left + 1;
+  int h = ci.srWindow.Bottom - ci.srWindow.Top + 1;
+  bool offsets = aligned_ && (ci.srWindow.Left != 0 || ci.srWindow.Top != 0);
+  if (w == lastW_ && h == lastH_ && !offsets) return false;
+  lastW_ = w;
+  lastH_ = h;
+  // 窗口尺寸变了：把缓冲区重新对齐成窗口大小，避免滚动带来的整体偏移
+  aligned_ = alignBuffer(hout_, COORD{(SHORT)w, (SHORT)h}) || aligned_;
+  int tw = 0, th = 0;
+  if (queryTermSize(hin_, hout_, tw, th) && tw >= 20 && th >= 8) {
+    termW_ = tw;
+    termH_ = th;
+  } else {
+    termW_ = 0;
+    termH_ = 0;
+  }
+  return true;
+}
+
 void App::loop() {
   for (;;) {
     poll();
@@ -1235,7 +1372,12 @@ void App::loop() {
       dirty_ = false;
     }
 
-    if (WaitForSingleObject(hin_, 200) == WAIT_OBJECT_0) {
+    DWORD waited = WaitForSingleObject(hin_, 200);
+    if (waited == WAIT_TIMEOUT) {
+      if (checkSize()) dirty_ = true;
+      continue;
+    }
+    if (waited == WAIT_OBJECT_0) {
       DWORD n = 0;
       if (GetNumberOfConsoleInputEvents(hin_, &n) && n > 0) {
         for (DWORD i = 0; i < n; i++) {
@@ -1245,8 +1387,10 @@ void App::loop() {
           // 只认按键：鼠标 / 焦点 / 菜单事件一律丢弃
           if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown)
             handleKey(rec.Event.KeyEvent);
-          else if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT)
+          else if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+            checkSize();
             dirty_ = true;
+          }
         }
       }
     }
