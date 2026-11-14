@@ -1280,10 +1280,11 @@ int cmdBookShelf(const Args& a) {
   return EX_OK;
 }
 
-/* 我的书：按登录账号过滤书阁索引 */
-int cmdBookMine(const Args& a) {
+/* 我的书 / 某个作者的书：按账号过滤书阁索引；profile=true 时先打作者资料 */
+int cmdBookMineImpl(const Args& a, bool profile) {
   Ctx c = makeCtx();
-  std::string me = c.cfg.login;
+  std::string me = a.pos.empty() ? "" : trim(a.pos[0]);
+  if (me.empty()) me = c.cfg.login;
   if (me.empty()) me = trim(a.str("author"));
   if (me.empty() && !c.token.empty()) {
     HttpResponse r = c.http.get("https://api.github.com/user",
@@ -1299,8 +1300,13 @@ int cmdBookMine(const Args& a) {
   if (me.empty())
     return fail(EX_AUTH, "不知道你的账号：先 bn login，或用 --author <账号> 指定", "auth");
 
-  nlohmann::json idx;
   std::string err;
+  nlohmann::json prof = nlohmann::json::object();
+  if (profile) {
+    if (!bookProfile(c, me, prof, err)) prof = nlohmann::json::object();
+  }
+
+  nlohmann::json idx;
   if (!bookIndex(c, idx, err)) return fail(errCode(err), err);
 
   std::vector<std::vector<std::string>> rows;
@@ -1328,11 +1334,23 @@ int cmdBookMine(const Args& a) {
                      {"updated_at", b.value("updatedAt", "")},
                      {"url", c.cfg.bookBase + "/book.html?id=" + id}});
   }
-  if (g.json) return ok("", nlohmann::json{{"author", me}, {"items", items}}), EX_OK;
+  if (g.json)
+    return ok("", nlohmann::json{{"author", me}, {"profile", prof}, {"items", items}}), EX_OK;
+  if (profile && !prof.empty()) {
+    std::cout << cBold(prof.value("name", me)) << cDim("  @" + me) << "\n";
+    if (!prof.value("bio", "").empty()) std::cout << cYellow(prof.value("bio", "")) << "\n";
+    std::cout << "\n";
+  }
   if (rows.empty()) return ok(cDim(me + " 名下还没有书。")), EX_OK;
   std::cout << cBold(me) << cDim(" 的书（" + std::to_string(rows.size()) + " 本）") << "\n";
   printTable({"书号", "书名", "分类", "章", "字数", "状态", "可见", "更新"}, rows);
   return EX_OK;
+}
+
+int cmdBookMine(const Args& a) { return cmdBookMineImpl(a, false); }
+int cmdBookAuthor(const Args& a) {
+  if (a.pos.empty()) return fail(EX_USAGE, "用法：bn book author <GitHub 账号>");
+  return cmdBookMineImpl(a, true);
 }
 
 /* 云端草稿（/api/works）：换设备接着写 */
@@ -1601,6 +1619,7 @@ int main(int argc, char** argv) {
     if (cmd == "collections" || cmd == "col") return cmdBookCollections(a);
     if (cmd == "shelf") return cmdBookShelf(a);
     if (cmd == "mine" || cmd == "my") return cmdBookMine(a);
+    if (cmd == "author" || cmd == "who") return cmdBookAuthor(a);
     if (cmd == "drafts" || cmd == "draft") return cmdBookDrafts(a);
     return fail(EX_USAGE, "未知命令：bn book " + cmd);
   }

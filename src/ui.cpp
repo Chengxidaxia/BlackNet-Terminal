@@ -129,7 +129,8 @@ void printHelp() {
       "  bn book publish <文件.book|目录> [--meta meta.json] [--dry]\n"
       "  bn book collections [list | show <id> | create | delete <id>]\n"
       "  bn book shelf                          云端书架\n"
-      "  bn book mine                           我名下的书（按登录账号）\n"
+      "  bn book mine [账号]                    我名下的书（给账号则看别人的）\n"
+      "  bn book author <账号>                  作者资料 + 他的书\n"
       "  bn book drafts [ls|show|pull|push|rm]  云端草稿：换台机器接着写\n"
       "\n"
       "全屏界面（只认键盘）\n"
@@ -178,7 +179,8 @@ void printBookHelp() {
       "  publish      发布/更新（.book 或目录均可，自动分片上传）\n"
       "  collections  作品集：list / show / create / delete\n"
       "  shelf        云端书架（需登录）\n"
-      "  mine         我名下的书（--author 指定别人）\n"
+      "  mine         我名下的书（给账号则看别人的）\n"
+      "  author       作者资料 + 他的书：bn book author Chengxidaxia\n"
       "  drafts       云端草稿：list / show <书号> / pull <书号> [-o 目录]\n"
       "               drafts push <目录> [--id 书号] / rm <书号> -y\n";
 }

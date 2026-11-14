@@ -60,5 +60,7 @@ bool bookWorksList(Ctx& c, nlohmann::json& out, std::string& err);
 bool bookWorksGet(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err);
 bool bookWorksSave(Ctx& c, const nlohmann::json& book, nlohmann::json& out, std::string& err);
 bool bookWorksDelete(Ctx& c, const std::string& id, nlohmann::json& out, std::string& err);
+// 作者资料（公开，无需登录）：/api/profile?u=<login>
+bool bookProfile(Ctx& c, const std::string& login, nlohmann::json& out, std::string& err);
 
 }  // namespace bn

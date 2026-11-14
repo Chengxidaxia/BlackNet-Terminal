@@ -222,7 +222,9 @@ bn book collections delete cl_xxx -y
 
 ```cmd
 bn book shelf        :: 云端收藏 + 阅读进度
-bn book mine         :: 我名下的书（按登录账号；--author 看别人）
+bn book mine         :: 我名下的书（按登录账号）
+bn book mine <账号>  :: 看别人名下的书
+bn book author <账号> :: 作者资料（昵称/简介）+ 他的书
 ```
 
 ### 云端草稿（换台机器接着写）

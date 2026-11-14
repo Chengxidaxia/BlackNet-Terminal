@@ -300,6 +300,10 @@ bool bookShelf(Ctx& c, nlohmann::json& out, std::string& err) {
   return httpJson(c, c.cfg.bookBase + "/api/shelf", out, err);
 }
 
+bool bookProfile(Ctx& c, const std::string& login, nlohmann::json& out, std::string& err) {
+  return httpJson(c, c.cfg.bookBase + "/api/profile?u=" + login, out, err);
+}
+
 bool bookWorksList(Ctx& c, nlohmann::json& out, std::string& err) {
   return httpJson(c, c.cfg.bookBase + "/api/works", out, err);
 }
