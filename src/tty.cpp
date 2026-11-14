@@ -68,25 +68,28 @@ int measureWide(HANDLE out) {
   return (w == 1 || w == 2) ? w : 2;
 }
 /* 向终端本身要真实可见尺寸。
-   ConPTY 下 GetConsoleScreenBufferInfo 给的 srWindow 有时是 conhost 自己的旧值，
-   和 Windows Terminal 真正的可见列数不一致 —— 界面就会右侧被切。
-   这里用 ESC[18t 问一次，终端会回 ESC[8;行;列t。问不到就返回 false，退回老办法。 */
+   ConPTY 下 GetConsoleScreenBufferInfo 给的是 conhost 自己的缓冲区尺寸，可能和终端可见列数不一致。
+   这里用「光标移到极限 + 位置报告（CPR）」问一次：ESC[9999;9999H 然后 ESC[6n，终端回 ESC[行;列R。
+   问不到就返回 false，退回老办法。 */
 bool queryTermSize(HANDLE hin, HANDLE hout, int& cols, int& rows) {
   DWORD oldIn = 0, oldOut = 0;
   if (!GetConsoleMode(hin, &oldIn) || !GetConsoleMode(hout, &oldOut)) return false;
   SetConsoleMode(hin, (oldIn | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~ENABLE_PROCESSED_INPUT);
-  SetConsoleMode(hout, oldOut | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-  const char req[] = "\x1b[18t";
+  if (!SetConsoleMode(hout, oldOut | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+    SetConsoleMode(hin, oldIn);
+    return false;
+  }
+  const char req[] = "\x1b[s\x1b[9999;9999H\x1b[6n\x1b[u";
   DWORD n = 0;
   WriteFile(hout, req, sizeof(req) - 1, &n, nullptr);
 
   bool ok = false;
   std::string buf;
   DWORD t0 = GetTickCount();
-  while (GetTickCount() - t0 < 150) {
+  while (GetTickCount() - t0 < 300) {
     DWORD avail = 0;
     if (!GetNumberOfConsoleInputEvents(hin, &avail) || avail == 0) {
-      Sleep(10);
+      Sleep(5);
       continue;
     }
     INPUT_RECORD rec;
@@ -95,16 +98,18 @@ bool queryTermSize(HANDLE hin, HANDLE hout, int& cols, int& rows) {
     if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
     wchar_t c = rec.Event.KeyEvent.uChar.UnicodeChar;
     if (c >= 32 && c < 128) buf += (char)c;
-    size_t p = buf.find("[8;");
-    if (p != std::string::npos && buf.size() >= p + 4) {
+    size_t p = buf.find("[");
+    while (p != std::string::npos) {
       int r = 0, cc = 0;
-      if (sscanf_s(buf.c_str() + p, "[8;%d;%dt", &r, &cc) == 2 && r > 0 && cc > 0) {
+      if (sscanf_s(buf.c_str() + p, "[%d;%dR", &r, &cc) == 2 && r > 0 && cc > 0) {
         rows = r;
         cols = cc;
         ok = true;
         break;
       }
+      p = buf.find("[", p + 1);
     }
+    if (ok) break;
     if (buf.size() > 96) buf.erase(0, 48);
   }
   SetConsoleMode(hin, oldIn);
@@ -190,11 +195,47 @@ std::vector<std::wstring> wrapText(const std::string& utf8, int width) {
 }
 
 /* ================= 画布 ================= */
+/* 把 WORD 颜色属性翻成 ANSI SGR：现代终端（Windows Terminal / conhost 开了 VT）都认。 */
+std::string sgrOf(WORD a) {
+  int fgbits = a & 0x0F, bgbits = (a >> 4) & 0x0F;
+  int f = 0, b = 0;
+  if (fgbits & FOREGROUND_RED) f |= 1;
+  if (fgbits & FOREGROUND_GREEN) f |= 2;
+  if (fgbits & FOREGROUND_BLUE) f |= 4;
+  if (bgbits & BACKGROUND_RED) b |= 1;
+  if (bgbits & BACKGROUND_GREEN) b |= 2;
+  if (bgbits & BACKGROUND_BLUE) b |= 4;
+  int fg = (fgbits & FOREGROUND_INTENSITY) ? 90 + f : 30 + f;
+  int bg = (bgbits & BACKGROUND_INTENSITY) ? 100 + b : 40 + b;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dm", fg, bg);
+  return std::string(buf);
+}
+
+void appendUtf8(std::string& out, uint32_t cp) {
+  if (cp < 0x80) {
+    out += (char)cp;
+  } else if (cp < 0x800) {
+    out += (char)(0xC0 | (cp >> 6));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += (char)(0xE0 | (cp >> 12));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else {
+    out += (char)(0xF0 | (cp >> 18));
+    out += (char)(0x80 | ((cp >> 12) & 0x3F));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  }
+}
+
 class Canvas {
  public:
-  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci, int maxW = 0, int maxH = 0) {
+  void begin(HANDLE out, const CONSOLE_SCREEN_BUFFER_INFO& ci, int maxW, int maxH, bool vt) {
     out_ = out;
-    origin_ = COORD{ci.srWindow.Left, ci.srWindow.Top};  // 画布原点 = 窗口左上角
+    vt_ = vt;
+    origin_ = COORD{ci.srWindow.Left, ci.srWindow.Top};
     W_ = ci.srWindow.Right - ci.srWindow.Left + 1;
     H_ = ci.srWindow.Bottom - ci.srWindow.Top + 1;
     // 终端自报的可见尺寸比 conhost 的更可信：宁可少画，也别画到屏幕外面去
@@ -212,15 +253,23 @@ class Canvas {
   void put(int x, int y, const std::wstring& s, WORD attr, int limit = -1) {
     if (y < 0 || y >= H_) return;
     int end = (limit < 0) ? W_ : std::min(W_, limit);
-    for (wchar_t ch : s) {
+    size_t i = 0;
+    while (i < s.size()) {
+      wchar_t ch = s[i];
       if (ch == L'\t') ch = L' ';
-      int cw = wcWidth(ch);
-      if (cw == 0) continue;
+      bool surrogate = (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < s.size() &&
+                        s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF);
+      int cw = surrogate ? g_wideW : wcWidth(ch);
+      if (cw == 0) { i++; continue; }
       if (x + cw > end) break;
-      if (x < 0) { x += cw; continue; }        // 右对齐时宽度不够，别写到缓冲区外
+      if (x < 0) { x += cw; i += surrogate ? 2 : 1; continue; }
       buf_[(size_t)y * W_ + x] = CHAR_INFO{ch, attr};
-      if (cw == 2 && x + 1 < W_) buf_[(size_t)y * W_ + x + 1] = CHAR_INFO{0, attr};
+      if (surrogate && x + 1 < W_)
+        buf_[(size_t)y * W_ + x + 1] = CHAR_INFO{s[i + 1], attr};
+      else if (cw == 2 && x + 1 < W_)
+        buf_[(size_t)y * W_ + x + 1] = CHAR_INFO{0, attr};
       x += cw;
+      i += surrogate ? 2 : 1;
     }
   }
   void fill(int x, int y, int n, wchar_t ch, WORD attr) {
@@ -228,6 +277,10 @@ class Canvas {
     for (int i = 0; i < n && x + i < W_; i++) buf_[(size_t)y * W_ + x + i] = CHAR_INFO{ch, attr};
   }
   void flush() {
+    if (vt_) {
+      flushVt();
+      return;
+    }
     COORD size{(SHORT)W_, (SHORT)H_};
     COORD pos{0, 0};
     SMALL_RECT rc{origin_.X, origin_.Y, (SHORT)(origin_.X + W_ - 1),
@@ -236,8 +289,48 @@ class Canvas {
   }
 
  private:
+  /* 一帧整屏写成 ANSI：光标定位到每行行首、按需换色、行尾清干净。
+     这样不依赖「控制台缓冲区坐标」，也就不会因为窗口变化把内容推到历史里。 */
+  void flushVt() {
+    std::string out;
+    out.reserve((size_t)W_ * 48 + 256);
+    out += "\x1b[?25l";   // 藏光标
+    WORD cur = 0xFFFF;
+    for (int y = 0; y < H_; y++) {
+      char cup[24];
+      snprintf(cup, sizeof(cup), "\x1b[%d;1H", y + 1);
+      out += cup;
+      cur = 0xFFFF;
+      for (int x = 0; x < W_; x++) {
+        const CHAR_INFO& c = buf_[(size_t)y * W_ + x];
+        wchar_t ch = c.Char.UnicodeChar;
+        if (ch == 0) continue;                    // 双宽字符的占位格
+        if (c.Attributes != cur) {
+          out += "\x1b[0m";
+          out += sgrOf(c.Attributes);
+          cur = c.Attributes;
+        }
+        if (ch >= 0xD800 && ch <= 0xDBFF && x + 1 < W_) {
+          wchar_t lo = buf_[(size_t)y * W_ + x + 1].Char.UnicodeChar;
+          if (lo >= 0xDC00 && lo <= 0xDFFF) {
+            appendUtf8(out, 0x10000u + ((uint32_t)(ch - 0xD800) << 10) +
+                                 (uint32_t)(lo - 0xDC00));
+            x++;
+            continue;
+          }
+        }
+        appendUtf8(out, (uint32_t)ch);
+      }
+      out += "\x1b[K";
+    }
+    out += "\x1b[0m";
+    DWORD n = 0;
+    WriteFile(out_, out.data(), (DWORD)out.size(), &n, nullptr);
+  }
+
   HANDLE out_ = INVALID_HANDLE_VALUE;
   int W_ = 0, H_ = 0;
+  bool vt_ = false;
   COORD origin_{0, 0};
   std::vector<CHAR_INFO> buf_;
 };
@@ -384,6 +477,7 @@ class App {
   bool aligned_ = false;      // 成功把窗口与缓冲区对齐过
   int lastW_ = 0, lastH_ = 0; // 上一帧的可见尺寸，用来感知窗口变化
   int termW_ = 0, termH_ = 0; // 终端自报的可见尺寸（VT 查询），0 = 没问到
+  bool vtOk_ = false;         // 能用 VT 序列画（现代终端）：走备用屏，不碰滚动历史
 };
 
 Ctx App::ctx() const {
@@ -449,11 +543,24 @@ bool App::init() {
   CONSOLE_SCREEN_BUFFER_INFO ci0;
   if (GetConsoleScreenBufferInfo(hout_, &ci0)) {
     oldBuf_ = ci0.dwSize;
-    COORD vp{(SHORT)(ci0.srWindow.Right - ci0.srWindow.Left + 1),
-             (SHORT)(ci0.srWindow.Bottom - ci0.srWindow.Top + 1)};
-    aligned_ = alignBuffer(hout_, vp);
-    lastW_ = vp.X;
-    lastH_ = vp.Y;
+    lastW_ = ci0.srWindow.Right - ci0.srWindow.Left + 1;
+    lastH_ = ci0.srWindow.Bottom - ci0.srWindow.Top + 1;
+  }
+  // 能开 VT 就进备用屏：界面画在另一个屏上，窗口拉大拉小都不会把内容推进历史
+  DWORD om = 0;
+  if (GetConsoleMode(hout_, &om) &&
+      SetConsoleMode(hout_, om | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+    vtOk_ = true;
+    const char enter[] = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l";
+    DWORD n = 0;
+    WriteFile(hout_, enter, sizeof(enter) - 1, &n, nullptr);
+  } else {
+    CONSOLE_SCREEN_BUFFER_INFO ci1;
+    if (GetConsoleScreenBufferInfo(hout_, &ci1)) {
+      COORD vp{(SHORT)(ci1.srWindow.Right - ci1.srWindow.Left + 1),
+               (SHORT)(ci1.srWindow.Bottom - ci1.srWindow.Top + 1)};
+      aligned_ = alignBuffer(hout_, vp);
+    }
   }
   if (queryTermSize(hin_, hout_, termW_, termH_)) {
     if (termW_ < 20 || termH_ < 8) { termW_ = 0; termH_ = 0; }
@@ -470,6 +577,12 @@ bool App::init() {
 
 void App::shutdown() {
   if (!ready_) return;
+  if (vtOk_) {
+    const char leave[] = "\x1b[0m\x1b[?25h\x1b[?1049l";
+    DWORD n = 0;
+    WriteFile(hout_, leave, sizeof(leave) - 1, &n, nullptr);
+    vtOk_ = false;
+  }
   CONSOLE_CURSOR_INFO ci = oldCursor_;
   SetConsoleCursorInfo(hout_, &ci);
   SetConsoleMode(hin_, oldInMode_);
@@ -1009,7 +1122,7 @@ void App::draw() {
   CONSOLE_SCREEN_BUFFER_INFO ci;
   if (!GetConsoleScreenBufferInfo(hout_, &ci)) return;
   Canvas cv;
-  cv.begin(hout_, ci, termW_, termH_);
+  cv.begin(hout_, ci, termW_, termH_, vtOk_);
   const int W = cv.w(), H = cv.h();
   cv.clear();
 
@@ -1343,8 +1456,8 @@ bool App::checkSize() {
   if (w == lastW_ && h == lastH_ && !offsets) return false;
   lastW_ = w;
   lastH_ = h;
-  // 窗口尺寸变了：把缓冲区重新对齐成窗口大小，避免滚动带来的整体偏移
-  aligned_ = alignBuffer(hout_, COORD{(SHORT)w, (SHORT)h}) || aligned_;
+  // 窗口尺寸变了：VT 模式不用管缓冲区；老路径把缓冲区重新对齐成窗口大小
+  if (!vtOk_) aligned_ = alignBuffer(hout_, COORD{(SHORT)w, (SHORT)h}) || aligned_;
   int tw = 0, th = 0;
   if (queryTermSize(hin_, hout_, tw, th) && tw >= 20 && th >= 8) {
     termW_ = tw;
