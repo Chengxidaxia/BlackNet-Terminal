@@ -147,16 +147,22 @@ std::vector<std::wstring> wrapText(const std::string& utf8, int width) {
 /* ================= 画布 ================= */
 /* 把 WORD 颜色属性翻成 ANSI SGR：现代终端（Windows Terminal / conhost 开了 VT）都认。 */
 std::string sgrOf(WORD a) {
+  /* Windows 属性低 4 位是前景（1=蓝 2=绿 4=红 8=亮），高 4 位是背景同构。
+     ANSI 的颜色码是 1=红 2=绿 4=蓝，所以要把 R/B 两位对调。
+     注意：背景那半必须先 >>4 再按 1/2/4 判断 —— 直接拿 BACKGROUND_RED(0x40)
+     去和移位后的值比是永远不成立的，会把所有底色画成黑色（1.0.4 的选中项
+     看不见、输入框没底色就是这么来的）。 */
   int fgbits = a & 0x0F, bgbits = (a >> 4) & 0x0F;
-  int f = 0, b = 0;
-  if (fgbits & FOREGROUND_RED) f |= 1;
-  if (fgbits & FOREGROUND_GREEN) f |= 2;
-  if (fgbits & FOREGROUND_BLUE) f |= 4;
-  if (bgbits & BACKGROUND_RED) b |= 1;
-  if (bgbits & BACKGROUND_GREEN) b |= 2;
-  if (bgbits & BACKGROUND_BLUE) b |= 4;
-  int fg = (fgbits & FOREGROUND_INTENSITY) ? 90 + f : 30 + f;
-  int bg = (bgbits & BACKGROUND_INTENSITY) ? 100 + b : 40 + b;
+  auto rgbToAnsi = [](int bits) {
+    int v = 0;
+    if (bits & 4) v |= 1;   // 红
+    if (bits & 2) v |= 2;   // 绿
+    if (bits & 1) v |= 4;   // 蓝
+    return v;
+  };
+  int f = rgbToAnsi(fgbits), b = rgbToAnsi(bgbits);
+  int fg = (fgbits & 8) ? 90 + f : 30 + f;
+  int bg = (bgbits & 8) ? 100 + b : 40 + b;
   char buf[24];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dm", fg, bg);
   return std::string(buf);
@@ -378,6 +384,7 @@ class App {
   int listCount() const;
   int contentHeight() const;
   void clampSel();
+  bool goBack();        // 退回上一级；已在最外层返回 false（= 该退出了）
   void setMsg(const std::string& s, WORD a = A_NORM);
   void refreshCurrent();
 
@@ -473,6 +480,30 @@ void App::clampSel() {
   if (sel_ < scroll_) scroll_ = sel_;
   if (sel_ >= scroll_ + h) scroll_ = sel_ - h + 1;
   if (scroll_ < 0) scroll_ = 0;
+}
+
+/* 退回上一级。q 和 Esc 都走这里：只有退无可退（列表 / 状态 / 帮助页）才真的退出，
+   免得在文章或章节里按一下 q 就把整个界面链式关掉。 */
+bool App::goBack() {
+  if (view_ == V_GRP && inDetail_) {
+    inDetail_ = false;
+    scroll_ = sel_;
+    return true;
+  }
+  if (view_ == V_BOOK && inChapter_) {
+    inChapter_ = false;
+    inChapters_ = true;
+    sel_ = chapIdx_;
+    scroll_ = 0;
+    clampSel();
+    return true;
+  }
+  if (view_ == V_BOOK && inChapters_) {
+    inChapters_ = false;
+    scroll_ = 0;
+    return true;
+  }
+  return false;
 }
 
 /* ================= 生命周期 ================= */
@@ -1028,54 +1059,84 @@ std::vector<Row> App::rowsStatus(int width) {
 }
 
 std::vector<Row> App::rowsHelp(int width) {
-  static const char* kLines[] = {
-      "BlackNet Terminal —— 一个键盘就能走完全程",
-      "",
-      "全局",
-      "  Tab / Shift+Tab   切换 主站 / 书阁 / 状态 / 帮助",
-      "  1 2 3 4           直接跳到对应页面",
-      "  r                 重新读取当前页",
-      "  q / Ctrl+C        退出",
-      "",
-      "主站",
-      "  ↑ ↓ / j k         选择        g / G         跳到首 / 尾",
-      "  Enter             打开文章    Esc           返回列表",
-      "  /                 搜索标题    c             切换分类",
-      "  s                 切换排序（默认 / 最新 / 点赞）",
-      "  a                 升序 / 降序",
-      "",
-      "文章",
-      "  ↑ ↓ / PgUp PgDn   滚动        Home / End    首 / 尾",
-      "  u                 点赞 / 取消",
-      "  c                 写一条评论（Enter 发送，Esc 取消）",
-      "",
-      "书阁",
-      "  ↑ ↓               选书        Enter         章节列表",
-      "  Enter（章节里）   读这一章    Esc           返回上一级",
-      "  /                 搜索书名 / 作者",
-      "",
-      "说明",
-      "  界面只用键盘：不读取鼠标，也不响应点击。",
-      "  网络请求都在后台线程，按键不会卡住。",
-      "  私密书请用命令行：bn book show <书号> --password 口令",
+  /* 帮助页按「固定宽度的键位列 + 自动折行的说明列」排。
+     不用空格串硬对齐：汉字占 2 格，手写的空格列一旦遇到中文就会错位。 */
+  struct HelpItem {
+    const char* key;
+    const char* desc;
   };
+  struct HelpSec {
+    const char* title;
+    std::vector<HelpItem> items;
+  };
+  static const std::vector<HelpSec> kSecs = {
+      {"全局",
+       {{"Tab / Shift+Tab", "切换 主站 / 书阁 / 状态 / 帮助"},
+        {"1 2 3 4", "直接跳到对应页面"},
+        {"r", "重新读取当前页"},
+        {"q / Esc", "返回上一级；已经在最外层就退出"},
+        {"Ctrl+C", "随时退出"}}},
+      {"主站",
+       {{"↑ ↓ / j k", "选择"},
+        {"g / G", "跳到首 / 尾"},
+        {"PgUp / PgDn", "翻页"},
+        {"Enter", "打开文章"},
+        {"Esc / q", "返回列表"},
+        {"/", "搜索标题"},
+        {"c", "切换分类"},
+        {"s", "切换排序（默认 / 最新 / 点赞）"},
+        {"a", "升序 / 降序"}}},
+      {"文章",
+       {{"↑ ↓ / PgUp PgDn", "滚动 / 翻页"},
+        {"Home / End", "跳到首 / 尾"},
+        {"u", "点赞 / 取消"},
+        {"c", "写一条评论（Enter 发送，Esc 取消）"}}},
+      {"书阁",
+       {{"↑ ↓", "选书"},
+        {"PgUp / PgDn", "翻页"},
+        {"Enter", "打开章节列表"},
+        {"Enter（章节目录里）", "读这一章"},
+        {"Esc / q", "返回上一级"},
+        {"/", "搜索书名 / 作者"}}},
+  };
+
+  const int keyW = 22;   // 键位列宽（含左侧 2 格缩进在内）
+  const int descX = keyW;
   std::vector<Row> out;
+  out.push_back({WW("BlackNet Terminal —— 一个键盘就能走完全程"), A_ACC, false});
+  out.push_back({L"", A_DIM, false});
+  for (auto& sec : kSecs) {
+    out.push_back({WW(sec.title), A_ACC, false});
+    for (auto& it : sec.items) {
+      std::vector<std::wstring> parts =
+          wrapText(it.desc, std::max(12, width - descX - 1));
+      for (size_t i = 0; i < parts.size(); i++) {
+        std::wstring line = (i == 0) ? L"  " + padTo(WW(it.key), keyW - 2) +
+                                           repeatW(L' ', descX - keyW)
+                                     : std::wstring((size_t)descX, L' ');
+        out.push_back({truncateTo(line + parts[i], width), A_NORM, false});
+      }
+    }
+    out.push_back({L"", A_DIM, false});
+  }
+  out.push_back({WW("说明"), A_ACC, false});
+  for (const char* s :
+       {"界面只用键盘：不读取鼠标，也不响应点击。",
+        "网络请求都在后台线程，按键不会卡住。",
+        "私密书请用命令行：bn book show <书号> --password 口令"}) {
+    for (auto& l : wrapText(s, std::max(12, width - 1)))
+      out.push_back({L"  " + l, A_DIM, false});
+  }
   int cw2 = headless_ ? fakeW_ : (termW_ > 0 ? termW_ : lastW_);
   int ch2 = headless_ ? fakeH_ : (termH_ > 0 ? termH_ : lastH_);
-  for (auto& l : kLines) {
-    std::string s = l;
-    WORD a = A_NORM;
-    bool isHead = !s.empty() && s[0] != ' ' && s.find("——") == std::string::npos;
-    if (s.empty()) a = A_DIM;
-    else if (isHead) a = A_ACC;
-    out.push_back({truncateTo(WW(s), width), a, false});
+  out.push_back({L"", A_DIM, false});
+  if (cw2 > 0) {
+    std::string note = "当前界面 " + std::to_string(cw2) + "×" + std::to_string(ch2) +
+                       " 格。汉字按 2 格排版；若字与字之间看着有缝，是终端字体没有"
+                       "等宽 CJK 字形（换成更纱黑体 / Maple Mono NF 之类会整）";
+    for (auto& l : wrapText(note, std::max(12, width - 1)))
+      out.push_back({L"  " + l, A_DIM, false});
   }
-  if (cw2 > 0)
-    out.push_back(
-        {WW("  当前界面 " + std::to_string(cw2) + "×" + std::to_string(ch2) +
-            " 格。汉字按 2 格排版；若字与字之间看着有缝，是终端字体没有等宽 CJK 字形"
-            "（换成更纱黑体 / Maple Mono NF 之类会整）"),
-         A_DIM, false});
   return out;
 }
 
@@ -1103,11 +1164,11 @@ void App::draw() {
   /* 标签栏（留一行上边距：某些终端会把最顶行吃掉） */
   const int topY = 1;
   cv.put(0, topY, L" bn " + WW(kVersion) + L" ", A_ACC);
-  int x = 4 + wstrWidth(WW(kVersion));
+  int x = 5 + wstrWidth(WW(kVersion));   // 「 bn 」4 格 + 版本 + 一个空格
   static const wchar_t* tabs[] = {L"主站", L"书阁", L"状态", L"帮助"};
   for (int i = 0; i < 4; i++) {
     std::wstring item = (i == view_ ? L"▸" : L" ") + std::wstring(tabs[i]) + L"  ";
-    cv.put(x, topY, item, i == view_ ? (A_NORM | BACKGROUND_INTENSITY) : A_DIM);
+    cv.put(x, topY, item, i == view_ ? A_TAB : A_DIM);
     x += wstrWidth(item);
   }
   std::wstring who = me_.empty() ? std::wstring(L"未登录 · 只读") : WW("@" + me_);
@@ -1158,14 +1219,14 @@ void App::draw() {
   if (edit_ != E_NONE) {
     keys = L"Enter 确认   Esc 取消   Backspace 删除";
   } else if (view_ == V_GRP) {
-    keys = inDetail_ ? L"↑↓ 滚动  u 点赞  c 评论  r 刷新  Esc 返回  Tab 切换  q 退出"
-                     : L"↑↓ 选择  Enter 打开  / 搜索  c 分类  s 排序  a 升降  r 刷新  Tab 切换  q 退出";
+    keys = inDetail_ ? L"↑↓ 滚动  PgUp/PgDn 翻页  Home/End 首尾  u 点赞  c 评论  r 刷新  Esc/q 返回  Tab 切换"
+                     : L"↑↓ 选择  PgUp/PgDn 翻页  Enter 打开  / 搜索  c 分类  s 排序  a 升降  r 刷新  Tab 切换  q 返回/退出";
   } else if (view_ == V_BOOK) {
-    if (inChapter_) keys = L"↑↓ PgUp PgDn 滚动  Esc 返回  Tab 切换  q 退出";
-    else if (inChapters_) keys = L"↑↓ 选择  Enter 阅读  Esc 返回  Tab 切换  q 退出";
-    else keys = L"↑↓ 选书  Enter 打开  / 搜索  r 刷新  Tab 切换  q 退出";
+    if (inChapter_) keys = L"↑↓ 滚动  PgUp/PgDn 翻页  Home/End 首尾  Esc/q 返回  Tab 切换";
+    else if (inChapters_) keys = L"↑↓ 选择  PgUp/PgDn 翻页  Enter 阅读  Esc/q 返回  Tab 切换";
+    else keys = L"↑↓ 选书  PgUp/PgDn 翻页  Enter 打开  / 搜索  r 刷新  Tab 切换  q 返回/退出";
   } else if (view_ == V_STATUS) {
-    keys = L"↑↓ PgUp PgDn 滚动  r 刷新  Tab 切换  q 退出";
+    keys = L"↑↓ PgUp/PgDn 滚动  r 刷新  Tab 切换  q 退出";
   } else {
     keys = L"Tab 切换  q 退出";
   }
@@ -1314,30 +1375,9 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
       dirty_ = true;
       return;
     }
-    case VK_ESCAPE: {
-      if (view_ == V_GRP && inDetail_) {
-        inDetail_ = false;
-        scroll_ = sel_;
-        dirty_ = true;
-        return;
-      }
-      if (view_ == V_BOOK && inChapter_) {
-        inChapter_ = false;
-        inChapters_ = true;
-        sel_ = chapIdx_;
-        scroll_ = 0;
-        clampSel();
-        dirty_ = true;
-        return;
-      }
-      if (view_ == V_BOOK && inChapters_) {
-        inChapters_ = false;
-        scroll_ = 0;
-        dirty_ = true;
-        return;
-      }
+    case VK_ESCAPE:
+      if (goBack()) dirty_ = true;
       return;
-    }
     case VK_RETURN: {
       if (view_ == V_GRP && !inDetail_ && sel_ < (int)posts_.size()) {
         loadDetail(posts_[(size_t)sel_].number);
@@ -1363,7 +1403,11 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
   wchar_t ch = (wchar_t)towlower((wint_t)k.uChar.UnicodeChar);
   if (ch == 0) return;
   switch (ch) {
-    case 'q': PostQuitMessage(0); return;
+    case 'q':
+      // 先退回上一级；已经在最外层才退出
+      if (goBack()) { dirty_ = true; return; }
+      PostQuitMessage(0);
+      return;
     case 'j': if (selectable) moveSel(1); else scrollBy(1); return;
     case 'k': if (selectable) moveSel(-1); else scrollBy(-1); return;
     case 'g': sel_ = 0; scroll_ = 0; dirty_ = true; return;

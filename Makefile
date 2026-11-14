@@ -2,7 +2,7 @@
 # 依赖：mingw-w64 g++、WinHTTP、BCrypt、zlib（均随 MSYS2 提供）
 
 CXX      ?= /k/Programs/msys64/mingw64/bin/g++
-CXXFLAGS ?= -std=c++17 -O2 -pipe -I. -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-unknown-pragmas
+CXXFLAGS ?= -std=c++17 -O2 -pipe -I. -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-unknown-pragmas -MMD -MP
 LDFLAGS  ?= -pipe -static -s
 LIBS     ?= -lwinhttp -lbcrypt -lcrypt32 -lshell32 -lz
 
@@ -28,6 +28,9 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ_DIR)/*.o $(TARGET)
+	rm -f $(OBJ_DIR)/*.o $(OBJ_DIR)/*.d $(TARGET)
+
+# 头文件依赖：改 version.h / api.h 之类会连带重编包含它的 .cpp
+-include $(OBJS:.o=.d)
 
 .PHONY: all clean
