@@ -25,7 +25,8 @@ static std::string envOr(const char* k) {
 Config loadConfig() {
   Config c;
   c.path = configPath();
-  // 环境变量可覆盖站点地址（自建部署 / 本地 mock 测试用）
+  // 环境变量优先：自建部署 / 本地 mock 测试用。注意配置文件里的值**不能**回头把它盖掉，
+  // 否则 `BLACKNET_GRP_BASE=http://127.0.0.1:xxxx bn ...` 会静默打到线上。
   std::string gb = envOr("BLACKNET_GRP_BASE"), bb = envOr("BLACKNET_BOOK_BASE");
   if (!gb.empty()) c.grpBase = gb;
   if (!bb.empty()) c.bookBase = bb;
@@ -33,8 +34,8 @@ Config loadConfig() {
   if (raw.empty()) return c;
   try {
     auto j = nlohmann::json::parse(raw);
-    if (j.contains("grp_base")) c.grpBase = j["grp_base"].get<std::string>();
-    if (j.contains("book_base")) c.bookBase = j["book_base"].get<std::string>();
+    if (gb.empty() && j.contains("grp_base")) c.grpBase = j["grp_base"].get<std::string>();
+    if (bb.empty() && j.contains("book_base")) c.bookBase = j["book_base"].get<std::string>();
     if (j.contains("login")) c.login = j["login"].get<std::string>();
     if (j.contains("name")) c.name = j["name"].get<std::string>();
     if (j.contains("avatar")) c.avatar = j["avatar"].get<std::string>();

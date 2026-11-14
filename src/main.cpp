@@ -519,6 +519,14 @@ int cmdGrpPost(const Args& a) {
   return EX_OK;
 }
 
+/* 从服务端返回里安全取 discussion.id：字段缺失或类型不对时返回空串，
+   而不是让 nlohmann 抛 type_error 把进程 abort 掉（mock / 后端改结构时踩过）。 */
+static std::string discussionIdOf(const nlohmann::json& j) {
+  if (j.is_object() && j.contains("discussion") && j["discussion"].is_object())
+    return j["discussion"].value("id", "");
+  return "";
+}
+
 int cmdGrpComment(const Args& a) {
   if (a.pos.empty()) return fail(EX_USAGE, "用法：bn grp comment <编号> -m 内容");
   int number = 0;
@@ -532,7 +540,8 @@ int cmdGrpComment(const Args& a) {
   nlohmann::json j;
   std::string err;
   if (!grpShow(c, number, 0, j, err)) return fail(errCode(err), err);
-  std::string did = j["discussion"].value("id", "");
+  std::string did = discussionIdOf(j);
+  if (did.empty()) return fail(EX_FAIL, "服务端返回里没有 discussion.id，没法评论");
   nlohmann::json out;
   if (!grpComment(c, did, msg, a.str("reply"), out, err)) return fail(errCode(err), err);
   ok(cGreen("✓ 评论已发布") + " → " + c.cfg.grpBase + "/blog.html?d=" + std::to_string(number),
@@ -559,7 +568,8 @@ int cmdGrpReact(const Args& a) {
   nlohmann::json j, out;
   std::string err;
   if (!grpShow(c, number, 0, j, err)) return fail(errCode(err), err);
-  std::string sid = j["discussion"].value("id", "");
+  std::string sid = discussionIdOf(j);
+  if (sid.empty()) return fail(EX_FAIL, "服务端返回里没有 discussion.id，没法操作反应");
   if (!grpReact(c, sid, it->second, a.has("remove"), out, err)) return fail(errCode(err), err);
   ok(cGreen(a.has("remove") ? "✓ 已取消反应 " : "✓ 已添加反应 ") + it->second + " → #" + std::to_string(number),
      nlohmann::json{{"number", number}, {"reaction", it->second}, {"removed", a.has("remove")}});
@@ -575,7 +585,8 @@ int cmdGrpUpvote(const Args& a) {
   nlohmann::json j, out;
   std::string err;
   if (!grpShow(c, number, 0, j, err)) return fail(errCode(err), err);
-  std::string sid = j["discussion"].value("id", "");
+  std::string sid = discussionIdOf(j);
+  if (sid.empty()) return fail(EX_FAIL, "服务端返回里没有 discussion.id，没法点赞");
   if (!grpUpvote(c, sid, a.has("remove"), out, err)) return fail(errCode(err), err);
   ok(cGreen(a.has("remove") ? "✓ 已取消点赞 " : "✓ 已点赞 ") + "#" + std::to_string(number),
      nlohmann::json{{"number", number}, {"removed", a.has("remove")}});

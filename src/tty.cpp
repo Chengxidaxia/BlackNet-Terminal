@@ -115,6 +115,23 @@ std::wstring truncateTo(const std::wstring& s, int width) {
 }
 std::wstring WW(const std::string& s) { return utf8ToWide(s); }
 
+/* 从尾部取不超过 width 列的内容（长输入时让用户总看到正在打的字）。
+   代理对按两个 wchar 一并处理，避免把 emoji 劈成半个。 */
+std::wstring tailTo(const std::wstring& s, int width) {
+  if (wstrWidth(s) <= width) return s;
+  int x = 0;
+  size_t i = s.size();
+  while (i > 0) {
+    size_t j = i - 1;
+    if (j > 0 && s[j] >= 0xDC00 && s[j] <= 0xDFFF) j--;   // 连带低代理一起退
+    int cw = wstrWidth(s.substr(j, i - j));
+    if (x + cw > width - 1) break;                        // 留一格给省略号
+    x += cw;
+    i = j;
+  }
+  return L"…" + s.substr(i);
+}
+
 /* 按显示宽度折行，保留空行 */
 std::vector<std::wstring> wrapText(const std::string& utf8, int width) {
   std::vector<std::wstring> out;
@@ -385,6 +402,7 @@ class App {
   int contentHeight() const;
   void clampSel();
   bool goBack();        // 退回上一级；已在最外层返回 false（= 该退出了）
+  void appendEditChar(wchar_t c);   // 输入框追加字符（含 IME / 代理对处理）
   void setMsg(const std::string& s, WORD a = A_NORM);
   void refreshCurrent();
 
@@ -429,6 +447,7 @@ class App {
 
   EditKind edit_ = E_NONE;
   std::string editBuf_;
+  wchar_t pendingHi_ = 0;     // 输入法/emoji 的高位代理，等下一半拼成码点
   std::string msg_;
   WORD msgAttr_ = A_NORM;
 
@@ -1122,6 +1141,7 @@ std::vector<Row> App::rowsHelp(int width) {
   out.push_back({WW("说明"), A_ACC, false});
   for (const char* s :
        {"界面只用键盘：不读取鼠标，也不响应点击。",
+        "输入框支持中文输入法：搜索标题、写评论都能直接打中文（Enter 确认，Esc 取消）。",
         "网络请求都在后台线程，按键不会卡住。",
         "私密书请用命令行：bn book show <书号> --password 口令"}) {
     for (auto& l : wrapText(s, std::max(12, width - 1)))
@@ -1205,7 +1225,8 @@ void App::draw() {
 
   if (edit_ != E_NONE) {
     std::wstring label = edit_ == E_COMMENT ? L"评论： " : L"搜索： ";
-    cv.put(1, H - 2, label + WW(editBuf_) + L"_", A_TAB, W - 1);
+    std::wstring body = tailTo(WW(editBuf_) + L"_", W - 2 - wstrWidth(label));
+    cv.put(1, H - 2, label + body, A_TAB, W - 1);
   } else {
     cv.put(1, H - 2, WW(msg_), msgAttr_, W - 1);
   }
@@ -1266,6 +1287,26 @@ void App::draw() {
 }
 
 /* ================= 交互 ================= */
+/* 往输入框追加一个字符。输入法（IME）上屏的中文/日文并不是一个个按键，而是
+   「虚拟键码 = 0、UnicodeChar = 结果字符」的记录，一次上屏可能连续来好几条；
+   表情符号还会拆成高/低代理两条，所以要缓存高位代理等下一半拼成完整码点。 */
+void App::appendEditChar(wchar_t c) {
+  if (c >= 0xD800 && c <= 0xDBFF) {   // 高代理：先存着，别自己转码
+    pendingHi_ = c;
+    return;
+  }
+  std::wstring w;
+  if (c >= 0xDC00 && c <= 0xDFFF && pendingHi_ != 0) {
+    w += pendingHi_;
+    w += c;
+  } else {
+    w += c;
+  }
+  pendingHi_ = 0;
+  editBuf_ += utf8ToWideLossless(w);
+  dirty_ = true;
+}
+
 void App::handleKey(const KEY_EVENT_RECORD& k) {
   DWORD ctl = k.dwControlKeyState;
   bool ctrl = (ctl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
@@ -1274,14 +1315,16 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
     return;
   }
   // 终端对转义序列的「回复」（比如光标位置报告）会以虚拟键码为 0 的字符形式
-  // 混进输入队列，其中的数字会被当成 1~4 切页 —— 一律不当按键处理。
-  if (k.wVirtualKeyCode == 0 && k.uChar.UnicodeChar != 0) return;
+  // 混进输入队列，其中的数字会被当成 1~4 切页 —— 非输入状态下这类记录一律丢弃。
+  // 但输入框里不能丢：输入法上屏的字符正是「虚拟键码 0 + 字符」。
+  if (k.wVirtualKeyCode == 0 && k.uChar.UnicodeChar != 0 && edit_ == E_NONE) return;
 
   /* ---- 输入框 ---- */
   if (edit_ != E_NONE) {
     if (k.wVirtualKeyCode == VK_ESCAPE) {
       edit_ = E_NONE;
       editBuf_.clear();
+      pendingHi_ = 0;
       dirty_ = true;
       return;
     }
@@ -1290,6 +1333,7 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
       std::string text = trim(editBuf_);
       edit_ = E_NONE;
       editBuf_.clear();
+      pendingHi_ = 0;
       dirty_ = true;
       if (!text.empty()) {
         if (kind == E_SEARCH_GRP) {
@@ -1332,8 +1376,7 @@ void App::handleKey(const KEY_EVENT_RECORD& k) {
       return;
     }
     if (k.uChar.UnicodeChar >= 32) {
-      wchar_t w[2] = {k.uChar.UnicodeChar, 0};
-      editBuf_ += utf8ToWideLossless(w);
+      appendEditChar(k.uChar.UnicodeChar);
       dirty_ = true;
     }
     return;
